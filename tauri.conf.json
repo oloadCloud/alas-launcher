@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "AzurPilot",
-  "version": "2.0.5",
+  "version": "2.0.8",
   "identifier": "moe.taiho.alas-launcher",
   "app": {
     "withGlobalTauri": true,
@@ -9,13 +9,14 @@
       {
         "label": "main",
         "title": "AzurPilot",
-        "width": 1280,
-        "height": 880,
+        "width": 1390,
+        "height": 985,
         "resizable": true,
         "url": "about:blank",
         "acceptFirstMouse": true,
         "visible": false,
-        "create": false
+        "create": false,
+		"center": true
       },
       {
         "label": "splash",
@@ -27,7 +28,8 @@
         "url": "about:blank",
         "acceptFirstMouse": true,
         "visible": false,
-        "create": true
+        "create": true,
+		"center": true
       }
     ]
   }

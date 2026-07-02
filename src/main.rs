@@ -53,6 +53,7 @@ use tauri::{
 };
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_dialog::FilePath;
+use tauri_plugin_window_state::StateFlags;
 #[cfg(windows)]
 use tauri_plugin_dialog::MessageDialogButtons;
 use tracing::{debug, error, info, warn};
@@ -1463,6 +1464,12 @@ fn main() -> Result<()> {
         ])
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+		.plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_filter(|label| label == "main")
+                .with_state_flags(StateFlags::all() ^ StateFlags::VISIBLE)
+                .build()
+        )
         .plugin(tauri_plugin_single_instance::init(
             move |app, _argv, _cwd| {
                 restore_main_window_from_tray(

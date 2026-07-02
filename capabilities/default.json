@@ -16,6 +16,7 @@
 	"core:default",
 	"dialog:default",
 	"notification:default",
+    "window-state:default",
 	"allow-window-minimize",
     "allow-window-hide",
     "allow-window-toggle-maximize",
