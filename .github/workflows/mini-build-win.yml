@@ -1,0 +1,33 @@
+name: Mini Build (Win Only)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-debug:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --verbose --release
+
+      - name: Upload alas-launcher.exe as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: alas-launcher-windows
+          path: target/release/alas-launcher.exe
+          
+      - name: Upload Cargo.lock as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-lock-file
+          path: Cargo.lock
