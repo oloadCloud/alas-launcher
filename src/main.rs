@@ -54,8 +54,7 @@ use tauri::{
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_dialog::FilePath;
 use tauri_plugin_window_state::StateFlags;
-#[cfg(windows)]
-use tauri_plugin_dialog::MessageDialogButtons;
+
 use tracing::{debug, error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
@@ -1431,8 +1430,6 @@ fn main() -> Result<()> {
     let setup_completed = Arc::new(AtomicBool::new(false));
     let startup_cleanup_started = Arc::new(AtomicBool::new(false));
     let recreating_main_window = Arc::new(AtomicBool::new(false));
-    #[cfg(windows)]
-    let close_prompt_active = Arc::new(AtomicBool::new(false));
 
     let allow_exit_for_setup = allow_exit.clone();
     let launch_blocked_for_setup = launch_blocked.clone();
@@ -1441,8 +1438,6 @@ fn main() -> Result<()> {
     let recreating_main_window_for_run = recreating_main_window.clone();
     let launch_blocked_for_run = launch_blocked.clone();
     let start_minimized_for_run = start_minimized;
-    #[cfg(windows)]
-    let close_prompt_active_for_run = close_prompt_active.clone();
 
     info!("Starting Webview...");
     tauri::Builder::default()
@@ -1824,7 +1819,7 @@ fn main() -> Result<()> {
                     if !should_allow {
                         api.prevent_exit();
                         debug!("Minimizing main window to tray");
-                        minimize_main_window_to_tray(&app_handle);
+                        minimize_main_window_to_tray(&app_handle, TrayMinimizeMode::Hide);
                         return;
                     }
 
@@ -1870,47 +1865,12 @@ fn main() -> Result<()> {
                         return;
                     }
 
-                    // Windows: ask whether to quit or minimize to tray.
+                    // Windows: destroy main window to release WebView resources.
                     #[cfg(windows)]
                     {
                         if label == "main" && !allow_exit.load(Ordering::SeqCst) {
                             api.prevent_close();
-                            if close_prompt_active_for_run
-                                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                                .is_ok()
-                            {
-                                let app_handle_for_dialog = app_handle.clone();
-                                let allow_exit_for_dialog = allow_exit.clone();
-                                let close_prompt_active_for_dialog =
-                                    close_prompt_active_for_run.clone();
-
-                                if let Some(main_window) = app_handle.get_webview_window("main") {
-                                    app_handle
-                                        .dialog()
-                                        .message(t!("dialog.confirm_exit"))
-                                        .title(t!("dialog.exit"))
-                                        .buttons(MessageDialogButtons::OkCancelCustom(
-                                            t!("dialog.exit").to_string(),
-                                            t!("dialog.minimize_to_tray").to_string(),
-                                        ))
-                                        .parent(&main_window)
-                                        .show(move |should_exit| {
-                                            close_prompt_active_for_dialog
-                                                .store(false, Ordering::SeqCst);
-                                            if should_exit {
-                                                allow_exit_for_dialog.store(true, Ordering::SeqCst);
-                                                app_handle_for_dialog.exit(0);
-                                            } else {
-                                                minimize_main_window_to_tray(
-                                                    &app_handle_for_dialog,
-                                                );
-                                            }
-                                        });
-                                } else {
-                                    close_prompt_active_for_run.store(false, Ordering::SeqCst);
-                                    minimize_main_window_to_tray(&app_handle);
-                                }
-                            }
+							minimize_main_window_to_tray(&app_handle, TrayMinimizeMode::Destroy);
                             return;
                         }
                     }
@@ -1921,7 +1881,7 @@ fn main() -> Result<()> {
                     {
                         if label == "main" && !allow_exit.load(Ordering::SeqCst) {
                             api.prevent_close();
-                            minimize_main_window_to_tray(&app_handle);
+                            minimize_main_window_to_tray(&app_handle, TrayMinimizeMode::Hide);
                             return;
                         }
                     }
@@ -1931,7 +1891,7 @@ fn main() -> Result<()> {
                     {
                         if label == "main" && !allow_exit.load(Ordering::SeqCst) {
                             api.prevent_close();
-                            minimize_main_window_to_tray(&app_handle);
+                            minimize_main_window_to_tray(&app_handle, TrayMinimizeMode::Hide);
                             return;
                         }
                     }
@@ -2056,7 +2016,7 @@ fn today_launcher_log_filename() -> String {
 
 #[tauri::command]
 fn window_hide(app_handle: tauri::AppHandle) -> tauri::Result<()> {
-    minimize_main_window_to_tray(&app_handle);
+    minimize_main_window_to_tray(&app_handle, TrayMinimizeMode::Hide);
     Ok(())
 }
 
@@ -3266,13 +3226,22 @@ fn reveal_window(window: &WebviewWindow) -> tauri::Result<()> {
     Ok(())
 }
 
-fn minimize_main_window_to_tray(app: &tauri::AppHandle) {
+#[derive(Copy, Clone, PartialEq)]
+enum TrayMinimizeMode {Hide,Destroy}
+fn minimize_main_window_to_tray(app: &tauri::AppHandle, mode: TrayMinimizeMode) {
     #[cfg(windows)]
     {
         if let Some(window) = app.get_webview_window("main") {
-            info!("Destroying main window to release WebView resources while trayed");
-            if let Err(e) = window.destroy() {
-                warn!("Failed to destroy main window for tray mode: {:?}", e);
+			if mode == TrayMinimizeMode::Destroy {
+                info!("Destroying main window to release WebView resources while trayed");
+                if let Err(e) = window.destroy() {
+                    warn!("Failed to destroy main window for tray mode: {:?}", e);
+                }
+            } else {
+                info!("Hiding main window (preserving page state) while trayed");
+                if let Err(e) = window.hide() {
+                    warn!("Failed to hide main window: {:?}", e);
+                }
             }
         }
     }
@@ -3352,7 +3321,7 @@ fn toggle_main_window_visibility(
         let is_visible = window.is_visible().unwrap_or(false);
         let is_minimized = window.is_minimized().unwrap_or(false);
         if is_visible && !is_minimized {
-            minimize_main_window_to_tray(app);
+            minimize_main_window_to_tray(app, TrayMinimizeMode::Hide);
         } else {
             restore_main_window_from_tray(app, port, recreating_main_window);
         }
