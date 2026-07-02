@@ -3243,6 +3243,7 @@ fn create_main_window(app: &tauri::AppHandle, port: u16) -> Result<WebviewWindow
     let main_window = tauri::WebviewWindowBuilder::from_config(app, main_config)?
         .on_navigation(move |url| handle_backend_navigation(app_for_navigation.clone(), port, url))
         .on_page_load(page_load_injector)
+		.general_autofill_enabled(false)
         .build()?;
     main_window.set_resizable(true)?;
 
