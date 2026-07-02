@@ -14,6 +14,7 @@
   },
   "permissions": [
 	"core:default",
+	"core:window:allow-start-dragging",
 	"dialog:default",
 	"notification:default",
     "window-state:default",
@@ -21,7 +22,6 @@
     "allow-window-hide",
     "allow-window-toggle-maximize",
     "allow-window-close",
-    "allow-window-start-dragging",
     "allow-window-is-maximized",
     "allow-retry-backend-connection",
     "allow-save-as",

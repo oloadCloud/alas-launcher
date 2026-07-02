@@ -29,7 +29,6 @@ fn main() {
         "window_minimize",
         "window_toggle_maximize",
         "window_close",
-        "window_start_dragging",
         "window_is_maximized",
         "retry_backend_connection",
         "save_as",

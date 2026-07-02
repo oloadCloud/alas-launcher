@@ -1454,7 +1454,6 @@ fn main() -> Result<()> {
             window_minimize,
             window_toggle_maximize,
             window_close,
-            window_start_dragging,
             window_is_maximized
         ])
         .plugin(tauri_plugin_dialog::init())
@@ -2039,11 +2038,6 @@ fn window_toggle_maximize(window: WebviewWindow) -> tauri::Result<bool> {
 #[tauri::command]
 fn window_close(window: WebviewWindow) -> tauri::Result<()> {
     window.close()
-}
-
-#[tauri::command]
-fn window_start_dragging(window: WebviewWindow) -> tauri::Result<()> {
-    window.start_dragging()
 }
 
 #[tauri::command]
@@ -3005,7 +2999,7 @@ fn splash_redesigned_shell_html(light_bg_b64: &str, dark_bg_b64: &str) -> String
 </head>
 <body>
   <div class="launcher-window">
-    <div id="splash-drag-region" class="top-bar">
+    <div id="splash-drag-region" class="top-bar" data-tauri-drag-region>
       <div class="brand-zone">
         <span class="app-title">AzurPilot</span>
         <span class="app-version">v$LAUNCHER_VERSION</span>
@@ -3124,17 +3118,6 @@ fn splash_redesigned_shell_html(light_bg_b64: &str, dark_bg_b64: &str) -> String
         splashActions.className = 'splash-actions';
       }
     };
-
-    document.getElementById('splash-drag-region').addEventListener('mousedown', event => {
-      if (event.button !== 0 || event.target.closest('button')) {
-        return;
-      }
-      if (typeof invoke === 'function') {
-        invoke('window_start_dragging').catch(error => {
-          console.error('Failed to drag splash window', error);
-        });
-      }
-    });
 
     document.getElementById('window-minimize').addEventListener('click', event => {
       event.stopPropagation();
@@ -3368,15 +3351,14 @@ fn main_window_titlebar_injection_script() -> String {
             if (!document.getElementById('alas-launcher-titlebar-style')) {
                 const style = document.createElement('style');
                 style.id = 'alas-launcher-titlebar-style';
-                style.textContent = ':root{--alas-titlebar-height:44px}#alas-launcher-titlebar{position:fixed;top:0;left:0;right:0;height:var(--alas-titlebar-height);z-index:2147483647;user-select:none;pointer-events:none;background:transparent}#alas-launcher-titlebar *{box-sizing:border-box}.alas-titlebar-drag-zone{position:absolute;inset:0 120px 0 0;height:100%;pointer-events:auto;background:transparent}.header-icon{display:flex;align-items:center;gap:8px;padding:0 12px;position:absolute;top:0;right:0;height:100%;pointer-events:auto}.icon{width:12px;height:12px;border-radius:50%;border:none;cursor:pointer;flex:0 0 auto;position:relative;transition:filter 120ms ease;display:inline-flex;align-items:center;justify-content:center}.icon:active{filter:brightness(0.85)}.icon-hide{background:#3b82f6;box-shadow:0 0 0 .5px #2563eb}.icon-close{background:#ff5f57;box-shadow:0 0 0 .5px #e0443e}.icon-minimize{background:#febc2e;box-shadow:0 0 0 .5px #d4a017}.icon-maximize{background:#28c840;box-shadow:0 0 0 .5px #14ae35}.icon svg{width:7px;height:7px;stroke:rgba(0,0,0,.72);fill:none;stroke-width:1.35;stroke-linecap:round;stroke-linejoin:round;opacity:0;transition:opacity 150ms ease}.header-icon:hover .icon svg{opacity:1}@media(max-width:680px){.alas-titlebar-drag-zone{inset-right:88px}}';
+                style.textContent = ':root{--alas-titlebar-height:44px}#alas-launcher-titlebar{position:fixed;top:0;left:0;right:0;height:var(--alas-titlebar-height);z-index:2147483647;user-select:none;background:transparent}#alas-launcher-titlebar *{box-sizing:border-box}.alas-titlebar-drag-zone{position:absolute;inset:0 120px 0 0;height:100%;background:transparent}.header-icon{display:flex;align-items:center;gap:8px;padding:0 12px;position:absolute;top:0;right:0;height:100%}.icon{width:12px;height:12px;border-radius:50%;border:none;cursor:pointer;flex:0 0 auto;position:relative;transition:filter 120ms ease;display:inline-flex;align-items:center;justify-content:center}.icon:active{filter:brightness(0.85)}.icon-hide{background:#3b82f6;box-shadow:0 0 0 .5px #2563eb}.icon-close{background:#ff5f57;box-shadow:0 0 0 .5px #e0443e}.icon-minimize{background:#febc2e;box-shadow:0 0 0 .5px #d4a017}.icon-maximize{background:#28c840;box-shadow:0 0 0 .5px #14ae35}.icon svg{width:7px;height:7px;stroke:rgba(0,0,0,.72);fill:none;stroke-width:1.35;stroke-linecap:round;stroke-linejoin:round;opacity:0;transition:opacity 150ms ease}.header-icon:hover .icon svg{opacity:1}@media(max-width:680px){.alas-titlebar-drag-zone{inset-right:88px}}';
                 document.head.appendChild(style);
             }
             const titlebar = document.createElement('div');
             titlebar.id = 'alas-launcher-titlebar';
-            titlebar.innerHTML = '<div class="alas-titlebar-drag-zone" aria-hidden="true"></div><div class="header-icon"><button type="button" class="icon icon-hide" data-action="hide" aria-label="'+i18n.hideLabel+'" title="'+i18n.hideLabel+'"><svg viewBox="0 0 6 6"><rect x="1" y="1" width="4" height="4" rx="1"/><path d="M2 3h2"/></svg></button><button type="button" class="icon icon-minimize" data-action="minimize" aria-label="'+i18n.minimizeLabel+'" title="'+i18n.minimizeTitle+'"><svg viewBox="0 0 6 6"><line x1="1" y1="3" x2="5" y2="3"/></svg></button><button type="button" class="icon icon-maximize" data-action="maximize" aria-label="'+i18n.maximizeLabel+'" title="'+i18n.maximizeTitle+'"><svg viewBox="0 0 6 6" class="svg-restore" style="display:none"><polyline points="1,3 1,1 3,1"/><polyline points="3,5 5,5 5,3"/></svg><svg viewBox="0 0 6 6" class="svg-maximize"><polyline points="1,2.5 1,1 2.5,1"/><polyline points="3.5,5 5,5 5,3.5"/></svg></button><button type="button" class="icon icon-close" data-action="close" aria-label="'+i18n.closeLabel+'" title="'+i18n.closeTitle+'"><svg viewBox="0 0 6 6"><line x1="1" y1="1" x2="5" y2="5"/><line x1="5" y1="1" x2="1" y2="5"/></svg></button></div>';
+            titlebar.innerHTML = '<div class="alas-titlebar-drag-zone" data-tauri-drag-region aria-hidden="true"></div><div class="header-icon"><button type="button" class="icon icon-hide" data-action="hide" aria-label="'+i18n.hideLabel+'" title="'+i18n.hideLabel+'"><svg viewBox="0 0 6 6"><rect x="1" y="1" width="4" height="4" rx="1"/><path d="M2 3h2"/></svg></button><button type="button" class="icon icon-minimize" data-action="minimize" aria-label="'+i18n.minimizeLabel+'" title="'+i18n.minimizeTitle+'"><svg viewBox="0 0 6 6"><line x1="1" y1="3" x2="5" y2="3"/></svg></button><button type="button" class="icon icon-maximize" data-action="maximize" aria-label="'+i18n.maximizeLabel+'" title="'+i18n.maximizeTitle+'"><svg viewBox="0 0 6 6" class="svg-restore" style="display:none"><polyline points="1,3 1,1 3,1"/><polyline points="3,5 5,5 5,3"/></svg><svg viewBox="0 0 6 6" class="svg-maximize"><polyline points="1,2.5 1,1 2.5,1"/><polyline points="3.5,5 5,5 5,3.5"/></svg></button><button type="button" class="icon icon-close" data-action="close" aria-label="'+i18n.closeLabel+'" title="'+i18n.closeTitle+'"><svg viewBox="0 0 6 6"><line x1="1" y1="1" x2="5" y2="5"/><line x1="5" y1="1" x2="1" y2="5"/></svg></button></div>';
             document.body.dataset.alasCustomTitlebar = 'true';
             document.body.prepend(titlebar);
-            const dragZone = titlebar.querySelector('.alas-titlebar-drag-zone');
             const maximizeButton = titlebar.querySelector('[data-action="maximize"]');
             const syncMaximizeState = async () => {
                 if (!maximizeButton) return;
@@ -3398,22 +3380,13 @@ fn main_window_titlebar_injection_script() -> String {
                         switch (button.dataset.action) {
                             case 'hide': await invoke('window_hide'); break;
                             case 'minimize': await invoke('window_minimize'); break;
-                            case 'maximize': await invoke('window_toggle_maximize'); await syncMaximizeState(); break;
+                            case 'maximize': await invoke('window_toggle_maximize'); break;
                             case 'close': await invoke('window_close'); break;
                         }
                     } catch (error) {
                         console.error('Failed to handle ' + button.dataset.action + ' window action', error);
                     }
                 });
-            });
-            dragZone.addEventListener('mousedown', event => {
-                if (event.button !== 0 || event.target.closest('button')) return;
-                invoke('window_start_dragging').catch(error => { console.error('Failed to start dragging from titlebar', error); });
-            });
-            dragZone.addEventListener('dblclick', async event => {
-                if (event.target.closest('button')) return;
-                try { await invoke('window_toggle_maximize'); await syncMaximizeState(); }
-                catch (error) { console.error('Failed to toggle maximize from titlebar', error); }
             });
             window.addEventListener('resize', () => { void syncMaximizeState(); });
             void syncMaximizeState();
