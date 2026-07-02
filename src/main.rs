@@ -2068,6 +2068,10 @@ if (!window.alas_launcher_injected) {
         window.addEventListener('popstate', event => {
             history.pushState(null, document.title, location.href);
         });
+        // Disable right-click menu
+        window.addEventListener('contextmenu', event => {
+            event.preventDefault();
+        }, { capture: true });
         // Overwrite original saveAs function
         window.saveAs = function (blob, filename) {
             const reader = new FileReader();
