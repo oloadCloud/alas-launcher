@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-download-today-gui-log"
+description = "Enables the download_today_gui_log command without any pre-configured scope."
+commands.allow = ["download_today_gui_log"]
+
+[[permission]]
+identifier = "deny-download-today-gui-log"
+description = "Denies the download_today_gui_log command without any pre-configured scope."
+commands.deny = ["download_today_gui_log"]

@@ -24,7 +24,19 @@ fn main() {
 </assembly>
 "#,
     );
-    let attrs = tauri_build::Attributes::new().windows_attributes(windows);
+    let tauri_app_manifest = tauri_build::AppManifest::new().commands(&[
+        "window_hide",
+        "window_minimize",
+        "window_toggle_maximize",
+        "window_close",
+        "window_start_dragging",
+        "window_is_maximized",
+        "retry_backend_connection",
+        "save_as",
+        "download_today_gui_log",
+        "download_today_launcher_log",
+    ]);
+    let attrs = tauri_build::Attributes::new().windows_attributes(windows).app_manifest(tauri_app_manifest);
     tauri_build::try_build(attrs).expect("failed to run tauri build script");
 
     // Ensure icons directory is watched for changes

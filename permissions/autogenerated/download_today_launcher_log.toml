@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-download-today-launcher-log"
+description = "Enables the download_today_launcher_log command without any pre-configured scope."
+commands.allow = ["download_today_launcher_log"]
+
+[[permission]]
+identifier = "deny-download-today-launcher-log"
+description = "Denies the download_today_launcher_log command without any pre-configured scope."
+commands.deny = ["download_today_launcher_log"]

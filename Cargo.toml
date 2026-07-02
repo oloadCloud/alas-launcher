@@ -1,6 +1,6 @@
 [package]
 name = "alas-launcher"
-version = "2.0.5"
+version = "2.0.8"
 description = "AzurPilot launcher built with Tauri"
 authors = ["Jianfeng Zhang <swordfeng123@gmail.com>"]
 edition = "2021"
@@ -23,7 +23,7 @@ tracing-appender = "0.2"
 command-group = "5.0.1"
 base64 = "0.22.1"
 tauri-plugin-dialog = "2"
-tauri-plugin-notification = "=2.0.0"
+tauri-plugin-notification = "=2"
 sysinfo = { version = "0.36.1", default-features = false, features = ["system"] }
 ctrlc = "3.5.0"
 chrono = { version = "0.4.41", default-features = false, features = ["clock"] }
