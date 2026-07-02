@@ -177,6 +177,9 @@ fn begin_startup_cleanup(
     setup_running: Arc<AtomicBool>,
     startup_cleanup_started: Arc<AtomicBool>,
 ) {
+	startup_cleanup_started.store(true, Ordering::SeqCst);
+	allow_exit.store(true, Ordering::SeqCst); let _ = (setup_cancel_requested, setup_running, startup_cleanup_started); app_handle.exit(0); return;
+	
     if startup_cleanup_started
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -359,6 +362,8 @@ fn launcher_version_is_mini(version: &str) -> bool {
 }
 
 fn check_launcher_update_and_restart(mut status_updater: impl FnMut(SplashUpdate)) -> Result<bool> {
+	return Ok(false);
+	
     if std::env::var_os(LAUNCHER_UPDATE_SKIP_ENV).is_some() {
         info!("Skipping launcher update check after restart");
         std::env::remove_var(LAUNCHER_UPDATE_SKIP_ENV);
