@@ -1,11 +1,12 @@
 [package]
 name = "alas-launcher"
-version = "2.0.8"
+version = "2.1.8"
 description = "AzurPilot launcher built with Tauri"
 authors = ["Jianfeng Zhang <swordfeng123@gmail.com>"]
 edition = "2021"
 
 [build-dependencies]
+base64 = "0.22.1"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
@@ -30,6 +31,7 @@ ctrlc = "3.5.0"
 chrono = { version = "0.4.41", default-features = false, features = ["clock"] }
 rust-i18n = "3"
 sys-locale = "0.3"
+tempfile = "3"
 
 [package.metadata.alas-launcher.time-bomb]
 enabled = false
@@ -53,5 +55,12 @@ openssl-probe = "0.1.6"
 notify-rust = "4.16.1"
 
 [profile.release]
-strip = true
-lto = true
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = 0
+incremental = false
+debug-assertions = false
+overflow-checks = false

@@ -76,6 +76,7 @@ pub fn start_notify_stream(
         let url = format!("http://127.0.0.1:{port}/api/notify_stream");
         let client = match Client::builder()
             .connect_timeout(Duration::from_secs(5))
+            .no_proxy()
             .build()
         {
             Ok(client) => client,

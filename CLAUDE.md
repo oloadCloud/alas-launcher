@@ -6,7 +6,7 @@
 
 ## 项目概述
 
-AzurPilot Launcher 是 [AzurPilot](https://github.com/wess09/AzurPilot) 的跨平台（Windows/macOS/Linux）桌面启动器，基于 **Tauri 2 + Rust** 构建。它通过内嵌的 `uv` 二进制文件管理独立的 Python 3.14.3 环境，处理基于 git 的更新，启动 Python WebUI 后端（`gui.py`），并提供原生 webview 壳（含启动画面、系统托盘、通知和自定义标题栏）。
+AzurPilot Launcher 是 [AzurPilot](https://github.com/wess09/AzurPilot) 的跨平台（Windows/macOS/Linux）桌面启动器，基于 **Tauri 2 + Rust** 构建。它通过内嵌的 `uv` 二进制文件管理独立的 Python 3.14.6 环境，处理基于 git 的更新，启动 Python WebUI 后端（`gui.py`），并提供原生 webview 壳（含启动画面、系统托盘、通知和自定义标题栏）。
 
 ## 构建与开发命令
 
@@ -112,7 +112,7 @@ locales/
 1. `main()` 初始化日志（写入 `log/{date}_launcher.txt`），读取 `config/deploy.yaml` 获取 WebUI 配置
 2. 创建 Tauri 应用：显示 splash 窗口（`alas-splash://` 自定义协议），隐藏 main 窗口
 3. 后台线程执行 `setup_alas_repo()`：
-   - `ensure_runtime_tools()`：下载 Python 3.14.3（通过 uv managed python）、创建可重定位 `.venv`、复制 uv/adb/git 到 `.venv`
+   - `ensure_runtime_tools()`：下载 Python 3.14.6（通过 uv managed python）、创建可重定位 `.venv`、复制 uv/adb/git 到 `.venv`；检测到 `.venv` 的 Python 低于 3.14.5 时会删除并重建整个环境
    - `git_update()`：通过 Python 脚本调用 `deploy.git.GitManager` 拉取最新代码（带重试，最多 20 次）
    - `uv_sync_project()`：执行 `uv sync --frozen --no-dev --no-install-project` 安装依赖
 4. `ManagedBackend::new()` 启动 `gui.py`，设置 `ALAS_LAUNCHER_PID` 环境变量，等待端口就绪（60 秒超时）
@@ -176,14 +176,14 @@ GitHub Actions（`.github/workflows/package.yml`）：
 - 构建矩阵：`ubuntu-22.04`、`macos-latest`、`windows-latest`
 - Linux/macOS 从源码编译 Git v2.49.1，Windows 下载 MinGit v2.51.0
 - 下载 Android platform-tools（adb）
-- 创建可重定位 `.venv`（Python 3.14.3 + uv + adb + git + requests）
+- 创建可重定位 `.venv`（Python 3.14.6 + uv + adb + git + requests）
 - 打包为 `tar.xz` 归档（国际版 + CN 镜像版）
 - 部署启动器自动更新载荷到 `alas.nanoda.work`（通过 SSH）
 
 ### 关键常量与配置
 
 - 默认 WebUI 端口：`22267`
-- Python 版本：`3.14.3`（`setup.rs` 中 `PYTHON_VERSION`）
+- Python 版本：`3.14.6`（`setup.rs` 中 `PYTHON_VERSION`）
 - Git 更新最大重试：20 次，间隔 1 秒
 - 后端端口等待超时：60 秒
 - 后端连接检查超时：500 毫秒

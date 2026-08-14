@@ -11,8 +11,31 @@ use command_group::{CommandGroup, GroupChild};
 use serde_json::Value as JsonValue;
 use tracing::{info, warn};
 
-use crate::setup::venv_python;
+use crate::setup::{isolate_python_child_environment, venv_python};
 use crate::window_util::CreateNoWindow as _;
+
+const BACKEND_STARTUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Debug)]
+pub(crate) struct BackendStartupTimeout {
+    port: u16,
+}
+
+impl std::fmt::Display for BackendStartupTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Timeout waiting for port {} to be ready",
+            self.port
+        )
+    }
+}
+
+impl std::error::Error for BackendStartupTimeout {}
+
+pub(crate) fn is_backend_startup_timeout(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<BackendStartupTimeout>().is_some()
+}
 
 #[derive(Clone, Debug)]
 pub struct WebuiLaunchConfig {
@@ -150,25 +173,36 @@ impl ManagedBackend {
         std::env::set_var("ALAS_LAUNCHER_PID", format!("{}", std::process::id()));
         kill_processes_using_port(config.port)?;
 
-        let child = Command::new(venv_python())
-            .args(config.args())
-            .group()
-            .create_no_window()
-            .spawn()?;
-        let res = Self { child: Some(child) };
+        let mut command = Command::new(venv_python());
+        command.args(config.args());
+        isolate_python_child_environment(&mut command);
+        let child = command.group().create_no_window().spawn()?;
+        let mut res = Self { child: Some(child) };
 
         let address = format!("127.0.0.1:{}", config.port).parse().unwrap();
         let start_time = std::time::Instant::now();
-        while start_time.elapsed() < Duration::from_secs(60) {
+        while start_time.elapsed() < BACKEND_STARTUP_TIMEOUT {
             if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
                 return Ok(res);
             }
+            if let Some(child) = res.child.as_mut() {
+                if let Some(status) = child.try_wait()? {
+                    return Err(anyhow!(
+                        "Backend exited before port {} was ready: {}",
+                        config.port,
+                        status
+                    ));
+                }
+            }
             sleep(Duration::from_millis(100));
         }
-        Err(anyhow!(
-            "Timeout waiting for port {} to be ready",
-            config.port
-        ))
+        res.terminate().map_err(|error| {
+            anyhow!(
+                "Failed to stop timed out backend on port {} before recovery: {error:#}",
+                config.port
+            )
+        })?;
+        Err(BackendStartupTimeout { port: config.port }.into())
     }
 
     pub fn terminate(&mut self) -> Result<ExitStatus> {
@@ -326,5 +360,23 @@ impl Drop for ManagedBackend {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_startup_timeout_is_five_minutes() {
+        assert_eq!(BACKEND_STARTUP_TIMEOUT, Duration::from_secs(5 * 60));
+    }
+
+    #[test]
+    fn backend_startup_timeout_is_identified_without_matching_other_errors() {
+        let timeout: anyhow::Error = BackendStartupTimeout { port: 22267 }.into();
+
+        assert!(is_backend_startup_timeout(&timeout));
+        assert!(!is_backend_startup_timeout(&anyhow!("other startup error")));
     }
 }

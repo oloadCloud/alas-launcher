@@ -31,6 +31,7 @@ pub fn start_launcher_control_stream(port: u16, allow_exit: Arc<AtomicBool>) {
         let report_url = format!("http://127.0.0.1:{port}/api/launcher/report");
         let client = match Client::builder()
             .connect_timeout(Duration::from_secs(5))
+            .no_proxy()
             .build()
         {
             Ok(client) => client,

@@ -17,26 +17,34 @@ use std::{
     cell::Cell,
     collections::HashMap,
     fs,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Write},
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex,
     },
     thread::{self},
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, Context, Result};
+use crate::{
+    backend::{is_backend_startup_timeout, ManagedBackend, WebuiLaunchConfig},
+    launcher_control::start_launcher_control_stream,
+    notify::{start_notify_stream, NotificationClickHandler},
+    setup::{
+        cleanup_runtime_for_rebuild, get_deploy_config, rebuild_venv_and_sync_dependencies,
+        setup_alas_repo, setup_environment, SplashUpdate,
+    },
+};
+use anyhow::{anyhow, bail, Context, Result};
 use base64::{prelude::BASE64_STANDARD, Engine};
 use chrono::{DateTime, FixedOffset, Local, Utc};
 use reqwest::{
     blocking::Client,
     header::{
-        HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, CONTENT_LENGTH, CONTENT_RANGE, DATE,
-        RANGE, USER_AGENT,
+        HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, CONTENT_RANGE, DATE, RANGE, USER_AGENT,
     },
     StatusCode,
 };
@@ -55,19 +63,10 @@ use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_dialog::FilePath;
 use tauri_plugin_window_state::StateFlags;
 
+use tempfile::Builder as TempDirBuilder;
 use tracing::{debug, error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
-
-use crate::{
-    backend::{ManagedBackend, WebuiLaunchConfig},
-    launcher_control::start_launcher_control_stream,
-    notify::{start_notify_stream, NotificationClickHandler},
-    setup::{
-        cleanup_runtime_for_rebuild, get_deploy_config, setup_alas_repo, setup_environment,
-        SplashUpdate,
-    },
-};
 
 #[cfg(target_os = "macos")]
 const MENUBAR_ICON_2X: &[u8] = include_bytes!("../icons/menubar@2x.png");
@@ -75,8 +74,8 @@ const MENUBAR_ICON_2X: &[u8] = include_bytes!("../icons/menubar@2x.png");
 const MENUBAR_ICON_1X: &[u8] = include_bytes!("../icons/menubar.png");
 #[cfg(windows)]
 const WINDOWS_TRAY_ICON: &[u8] = include_bytes!("../icons/icon.png");
-const SPLASH_BG_LIGHT: &[u8] = include_bytes!("../bg/l_bg.webp");
-const SPLASH_BG_DARK: &[u8] = include_bytes!("../bg/b_bg.webp");
+const SPLASH_BG_VIDEO: &[u8] = include_bytes!("../bg/bg.mp4");
+const MI_SANS_FONT: &[u8] = include_bytes!("../fonts/MiSansLauncher.ttf");
 const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const BACKEND_NAVIGATION_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(any(windows, target_os = "android"))]
@@ -88,13 +87,20 @@ const SPLASH_URL: &str = "http://alas-splash.localhost/";
 #[cfg(not(any(windows, target_os = "android")))]
 const SPLASH_URL: &str = "alas-splash://localhost/";
 const TIME_BOMB_CONFIG_SOURCE: &str = include_str!("../Cargo.toml");
-const LAUNCHER_UPDATE_URL: &str = "https://alas.nanoda.work/updata/stable.json";
+#[cfg(test)]
+const TAURI_CONFIG_SOURCE: &str = include_str!("../tauri.conf.json");
+const LAUNCHER_UPDATE_URL: &str = env!("LAUNCHER_UPDATE_URL");
+const LAUNCHER_UPDATE_FALLBACK_URL: &str =
+    "https://ap.launcher-update.nanoda.work/updata/stable.json";
 const LAUNCHER_UPDATE_SKIP_ENV: &str = "AZURPILOT_SKIP_LAUNCHER_UPDATE";
 const MINI_LAUNCHER_VERSION: &str = "0.0.1";
-const LAUNCHER_UPDATE_MIN_PARALLEL_BYTES: u64 = 4 * 1024 * 1024;
-const LAUNCHER_UPDATE_MAX_CHUNK_BYTES: u64 = 500 * 1024;
-const LAUNCHER_UPDATE_MIN_CHUNK_BYTES: u64 = 64 * 1024;
+const LAUNCHER_UPDATE_MTLS_IDENTITY: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/launcher_mtls_identity.pem"));
 const LAUNCHER_UPDATE_BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 AZURPILOT_LAUNCHER_UPDATE/2.0.4";
+const LAUNCHER_UPDATE_MAX_CONNECTIONS: usize = 8;
+const LAUNCHER_UPDATE_MIN_CHUNK_BYTES: u64 = 1024 * 1024;
+const LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START: u8 = 8;
+const LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_END: u8 = 88;
 #[cfg(windows)]
 const LAUNCHER_UPDATE_NO_CONSOLE_ENV: &str = "AZURPILOT_NO_ATTACH_CONSOLE";
 #[cfg(windows)]
@@ -137,10 +143,10 @@ struct LauncherUpdatePlatform {
     sha256: String,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct LauncherUpdateProbe {
-    total_bytes: Option<u64>,
-    supports_ranges: bool,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LauncherUpdateByteRange {
+    start: u64,
+    end: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -318,6 +324,7 @@ fn time_bomb_expiration_message() -> Result<Option<String>> {
 fn fetch_network_time(url: &str) -> Result<DateTime<Utc>> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
+        .no_proxy()
         .build()?;
     let response = client.get(url).send()?;
     let date_header = response
@@ -345,16 +352,76 @@ fn launcher_update_browser_headers() -> HeaderMap {
     headers
 }
 
-fn launcher_update_http_client(timeout: Option<Duration>) -> Result<Client> {
+fn launcher_update_http_client(
+    timeout: Option<Duration>,
+    with_mtls_identity: bool,
+) -> Result<Client> {
     let mut builder = Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .no_proxy()
         .default_headers(launcher_update_browser_headers());
+    if with_mtls_identity && !LAUNCHER_UPDATE_MTLS_IDENTITY.is_empty() {
+        builder = builder.identity(reqwest::Identity::from_pem(LAUNCHER_UPDATE_MTLS_IDENTITY)?);
+    }
     builder = match timeout {
         Some(timeout) => builder.timeout(timeout),
         None => builder.timeout(None),
     };
     Ok(builder.build()?)
+}
+
+fn fetch_launcher_update_manifest(client: &Client) -> Result<LauncherUpdateManifest> {
+    fetch_launcher_update_manifest_from_urls(
+        client,
+        &[LAUNCHER_UPDATE_URL, LAUNCHER_UPDATE_FALLBACK_URL],
+    )
+}
+
+fn fetch_launcher_update_manifest_from_urls(
+    client: &Client,
+    urls: &[&str],
+) -> Result<LauncherUpdateManifest> {
+    let mut failures = Vec::new();
+
+    for (index, url) in urls.iter().enumerate() {
+        if urls[..index].iter().any(|previous| previous == url) {
+            continue;
+        }
+
+        match fetch_launcher_update_manifest_from_url(client, url) {
+            Ok(manifest) => {
+                if index > 0 {
+                    info!("Using fallback launcher update manifest: {url}");
+                }
+                return Ok(manifest);
+            }
+            Err(error) => {
+                warn!("Unable to fetch launcher update manifest from {url}: {error:#}");
+                failures.push(format!("{url}: {error:#}"));
+            }
+        }
+    }
+
+    bail!(
+        "Unable to fetch launcher update manifest from all configured URLs: {}",
+        failures.join("; ")
+    )
+}
+
+fn fetch_launcher_update_manifest_from_url(
+    client: &Client,
+    url: &str,
+) -> Result<LauncherUpdateManifest> {
+    let manifest_text = client
+        .get(url)
+        .send()
+        .with_context(|| format!("request launcher update manifest from {url}"))?
+        .error_for_status()
+        .with_context(|| format!("validate launcher update manifest response from {url}"))?
+        .text()
+        .with_context(|| format!("read launcher update manifest from {url}"))?;
+    serde_json::from_str(&manifest_text)
+        .with_context(|| format!("parse launcher update manifest from {url}"))
 }
 
 fn launcher_version_is_mini(version: &str) -> bool {
@@ -373,52 +440,37 @@ fn check_launcher_update_and_restart(mut status_updater: impl FnMut(SplashUpdate
     let current_version = env!("CARGO_PKG_VERSION");
     let mini_launcher = launcher_version_is_mini(current_version);
     let platform_key = launcher_update_platform_key();
-    let manifest_client = match launcher_update_http_client(Some(Duration::from_secs(10))) {
+    let manifest_client = match launcher_update_http_client(Some(Duration::from_secs(10)), false) {
         Ok(client) => client,
         Err(err) => {
             warn!("Unable to create launcher update client: {err:#}");
-            if mini_launcher {
-                return Err(anyhow!(t!(
-                    "launcher_update.mini_check_failed",
-                    error = format!("{err:#}")
-                )));
-            }
-            return Ok(false);
+            return Err(anyhow!(t!(
+                "launcher_update.check_failed",
+                error = format!("{err:#}")
+            )));
         }
     };
-    let manifest_text = match (|| -> Result<String> {
-        Ok(manifest_client
-            .get(LAUNCHER_UPDATE_URL)
-            .send()?
-            .error_for_status()?
-            .text()?)
-    })() {
-        Ok(text) => text,
-        Err(err) => {
-            warn!("Unable to fetch launcher update manifest: {err:#}");
-            if mini_launcher {
-                return Err(anyhow!(t!(
-                    "launcher_update.mini_check_failed",
-                    error = format!("{err:#}")
-                )));
-            }
-            return Ok(false);
-        }
-    };
-    let manifest: LauncherUpdateManifest = match serde_json::from_str(&manifest_text) {
+    let manifest = match fetch_launcher_update_manifest(&manifest_client) {
         Ok(manifest) => manifest,
         Err(err) => {
-            warn!("Unable to parse launcher update manifest: {err:#}");
-            if mini_launcher {
-                return Err(anyhow!(t!(
-                    "launcher_update.mini_check_failed",
-                    error = format!("{err:#}")
-                )));
-            }
-            return Ok(false);
+            return Err(anyhow!(t!(
+                "launcher_update.check_failed",
+                error = format!("{err:#}")
+            )));
         }
     };
-    if !launcher_version_is_newer(current_version, &manifest.version) {
+    let update_available = launcher_version_is_newer(current_version, &manifest.version)
+        .ok_or_else(|| {
+            warn!(
+                "Launcher update manifest contains an invalid version: {}",
+                manifest.version
+            );
+            anyhow!(t!(
+                "launcher_update.invalid_manifest_version",
+                version = manifest.version.clone()
+            ))
+        })?;
+    if !update_available {
         info!(
             "Launcher is up to date: current={}, latest={}",
             current_version, manifest.version
@@ -435,13 +487,10 @@ fn check_launcher_update_and_restart(mut status_updater: impl FnMut(SplashUpdate
 
     let Some(platform) = manifest.platforms.get(platform_key) else {
         warn!("No launcher update payload for platform {platform_key}");
-        if mini_launcher {
-            return Err(anyhow!(t!(
-                "launcher_update.mini_payload_missing",
-                platform = platform_key
-            )));
-        }
-        return Ok(false);
+        return Err(anyhow!(t!(
+            "launcher_update.payload_missing",
+            platform = platform_key
+        )));
     };
 
     info!(
@@ -469,10 +518,7 @@ fn check_launcher_update_and_restart(mut status_updater: impl FnMut(SplashUpdate
         &mut status_updater,
     ) {
         warn!("Launcher update download failed: {err:#}");
-        if mini_launcher {
-            return Err(err);
-        }
-        return Ok(false);
+        return Err(err);
     }
     make_executable(&update_path)?;
     status_updater(
@@ -485,10 +531,7 @@ fn check_launcher_update_and_restart(mut status_updater: impl FnMut(SplashUpdate
     );
     if let Err(err) = replace_launcher_and_restart(&current_exe, &update_path) {
         warn!("Launcher update replacement failed: {err:#}");
-        if mini_launcher {
-            return Err(err);
-        }
-        return Ok(false);
+        return Err(err);
     }
     Ok(true)
 }
@@ -499,44 +542,61 @@ fn download_launcher_update(
     expected_sha256: &str,
     mut status_updater: impl FnMut(SplashUpdate),
 ) -> Result<()> {
-    let client = launcher_update_http_client(None)?;
+    validate_launcher_update_payload(url, expected_sha256)?;
+
+    // The public manifest supplies the payload URL; ESA requires mTLS for the payload itself.
+    let client = launcher_update_http_client(None, true)?;
+    let part_path = launcher_update_part_path(update_path);
+    remove_launcher_update_file_if_exists(&part_path)?;
+    remove_launcher_update_file_if_exists(update_path)?;
+
     info!("Downloading launcher update from {url}");
-    let probe = launcher_update_probe(&client, url);
-    let downloaded = if let Some(total_bytes) = probe.total_bytes {
-        if total_bytes >= LAUNCHER_UPDATE_MIN_PARALLEL_BYTES && probe.supports_ranges {
-            match download_launcher_update_parallel(
-                &client,
-                url,
-                update_path,
-                total_bytes,
-                &mut status_updater,
-            ) {
-                Ok(downloaded) => downloaded,
-                Err(err) => {
-                    warn!(
-                        "Parallel launcher update download failed, falling back to sequential: {err:#}"
-                    );
-                    let _ = fs::remove_file(update_path);
-                    download_launcher_update_sequential(
-                        &client,
-                        url,
-                        update_path,
-                        Some(total_bytes),
-                        &mut status_updater,
-                    )?
-                }
+    let range_total = launcher_update_range_total(&client, url)?;
+    let download_result = match range_total {
+        Some(total_bytes) => {
+            let ranges = launcher_update_byte_ranges(total_bytes);
+            if ranges.len() > 1 {
+                status_updater(
+                    SplashUpdate::loading(
+                        t!("launcher_update.updating"),
+                        t!(
+                            "launcher_update.parallel_downloading_detail",
+                            connections = ranges.len().to_string()
+                        ),
+                        LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START,
+                    )
+                    .with_subtitle(t!("launcher_update.status")),
+                );
+                download_launcher_update_parallel(
+                    &client,
+                    url,
+                    total_bytes,
+                    &ranges,
+                    &part_path,
+                    &mut status_updater,
+                )
+            } else {
+                info!("Launcher update payload is too small for parallel download");
+                download_launcher_update_sequential(
+                    &client,
+                    url,
+                    &part_path,
+                    Some(total_bytes),
+                    &mut status_updater,
+                )
             }
-        } else {
-            download_launcher_update_sequential(
-                &client,
-                url,
-                update_path,
-                Some(total_bytes),
-                &mut status_updater,
-            )?
         }
-    } else {
-        download_launcher_update_sequential(&client, url, update_path, None, &mut status_updater)?
+        None => {
+            info!("Launcher update server does not support HTTP byte ranges; using one connection");
+            download_launcher_update_sequential(&client, url, &part_path, None, &mut status_updater)
+        }
+    };
+    let _downloaded = match download_result {
+        Ok(downloaded) => downloaded,
+        Err(err) => {
+            cleanup_launcher_update_download_files(&part_path, update_path);
+            return Err(err);
+        }
     };
 
     status_updater(
@@ -548,15 +608,14 @@ fn download_launcher_update(
         .with_subtitle(t!("launcher_update.status")),
     );
 
-    let digest_hex = sha256_file(update_path)?;
-    if !digest_hex.eq_ignore_ascii_case(expected_sha256) {
-        let _ = fs::remove_file(update_path);
-        return Err(anyhow!(
-            "launcher update sha256 mismatch: expected {}, got {}",
-            expected_sha256,
-            digest_hex
-        ));
-    }
+    let downloaded =
+        match verify_and_promote_launcher_update(&part_path, update_path, expected_sha256) {
+            Ok(downloaded) => downloaded,
+            Err(err) => {
+                cleanup_launcher_update_download_files(&part_path, update_path);
+                return Err(err);
+            }
+        };
 
     info!(
         "Launcher update downloaded: {} bytes -> {}",
@@ -566,81 +625,346 @@ fn download_launcher_update(
     Ok(())
 }
 
-fn launcher_update_probe(client: &Client, url: &str) -> LauncherUpdateProbe {
-    let head_total = launcher_update_head_content_length(client, url);
-    let range_probe = launcher_update_range_probe(client, url);
-
-    LauncherUpdateProbe {
-        total_bytes: head_total.or(range_probe.total_bytes),
-        supports_ranges: range_probe.supports_ranges,
+fn validate_launcher_update_payload(url: &str, expected_sha256: &str) -> Result<()> {
+    let parsed_url =
+        Url::parse(url).with_context(|| format!("invalid launcher update URL: {url}"))?;
+    if parsed_url.scheme() != "https" || parsed_url.host_str().is_none() {
+        bail!("launcher update URL must use HTTPS and include a host: {url}");
     }
+    if !launcher_update_sha256_is_valid(expected_sha256) {
+        bail!("launcher update manifest contains an invalid SHA-256 digest");
+    }
+    Ok(())
 }
 
-fn launcher_update_head_content_length(client: &Client, url: &str) -> Option<u64> {
-    let response = match client.head(url).send() {
-        Ok(response) => response,
-        Err(err) => {
-            warn!("Unable to probe launcher update size with HEAD: {err:#}");
-            return None;
-        }
-    };
-
-    if !response.status().is_success() {
-        warn!(
-            "Launcher update HEAD probe returned unexpected status: {}",
-            response.status()
-        );
-        return None;
-    }
-
-    response
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value > 0)
+fn launcher_update_sha256_is_valid(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn launcher_update_range_probe(client: &Client, url: &str) -> LauncherUpdateProbe {
-    let response = match client.get(url).header(RANGE, "bytes=0-0").send() {
-        Ok(response) => response,
-        Err(err) => {
-            warn!("Unable to probe launcher update range support: {err:#}");
-            return LauncherUpdateProbe {
-                total_bytes: None,
-                supports_ranges: false,
-            };
-        }
-    };
-
+fn launcher_update_range_total(client: &Client, url: &str) -> Result<Option<u64>> {
+    let response = client
+        .get(url)
+        .header(RANGE, "bytes=0-0")
+        .send()?
+        .error_for_status()?;
     if response.status() != StatusCode::PARTIAL_CONTENT {
-        warn!(
-            "Launcher update range probe returned unexpected status: {}",
-            response.status()
-        );
-        return LauncherUpdateProbe {
-            total_bytes: None,
-            supports_ranges: false,
-        };
+        return Ok(None);
     }
 
-    let total_bytes = response
+    let Some((start, end, total)) = response
         .headers()
         .get(CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
-        .and_then(content_range_total_bytes);
+        .and_then(parse_launcher_update_content_range)
+    else {
+        return Ok(None);
+    };
+    if start != 0 || end != 0 || total == 0 {
+        return Ok(None);
+    }
+    Ok(Some(total))
+}
 
-    LauncherUpdateProbe {
+fn parse_launcher_update_content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let value = value.trim().strip_prefix("bytes ")?;
+    let (range, total) = value.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse().ok()?;
+    let end = end.parse().ok()?;
+    let total = total.parse().ok()?;
+    (start <= end && end < total).then_some((start, end, total))
+}
+
+fn launcher_update_byte_ranges(total_bytes: u64) -> Vec<LauncherUpdateByteRange> {
+    if total_bytes == 0 {
+        return Vec::new();
+    }
+
+    let range_count = total_bytes
+        .saturating_add(LAUNCHER_UPDATE_MIN_CHUNK_BYTES - 1)
+        .checked_div(LAUNCHER_UPDATE_MIN_CHUNK_BYTES)
+        .unwrap_or(1)
+        .clamp(1, LAUNCHER_UPDATE_MAX_CONNECTIONS as u64) as usize;
+    let base_size = total_bytes / range_count as u64;
+    let extra_bytes = total_bytes % range_count as u64;
+    let mut start = 0;
+    let mut ranges = Vec::with_capacity(range_count);
+
+    for index in 0..range_count {
+        let size = base_size + u64::from(index < extra_bytes as usize);
+        let end = start + size - 1;
+        ranges.push(LauncherUpdateByteRange { start, end });
+        start = end + 1;
+    }
+    ranges
+}
+
+fn download_launcher_update_parallel(
+    client: &Client,
+    url: &str,
+    total_bytes: u64,
+    ranges: &[LauncherUpdateByteRange],
+    part_path: &Path,
+    status_updater: &mut impl FnMut(SplashUpdate),
+) -> Result<u64> {
+    let temp_dir = TempDirBuilder::new()
+        .prefix("azurpilot-launcher-update-")
+        .tempdir()
+        .context("create temporary launcher update download directory")?;
+    let (progress_sender, progress_receiver) = mpsc::channel();
+    let mut workers = Vec::with_capacity(ranges.len());
+    let mut chunk_paths = Vec::with_capacity(ranges.len());
+
+    for (index, range) in ranges.iter().copied().enumerate() {
+        let chunk_path = temp_dir.path().join(format!("chunk-{index:02}"));
+        let worker_client = client.clone();
+        let worker_url = url.to_owned();
+        let worker_path = chunk_path.clone();
+        let worker_sender = progress_sender.clone();
+        workers.push(thread::spawn(move || {
+            download_launcher_update_range(
+                &worker_client,
+                &worker_url,
+                range,
+                &worker_path,
+                &worker_sender,
+            )
+        }));
+        chunk_paths.push(chunk_path);
+    }
+    drop(progress_sender);
+
+    let started_at = Instant::now();
+    let mut downloaded_so_far = 0u64;
+    let mut last_reported_progress = LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START;
+    let mut last_reported_at = Instant::now() - Duration::from_secs(1);
+    while workers.iter().any(|worker| !worker.is_finished()) {
+        match progress_receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(downloaded) => {
+                downloaded_so_far = downloaded_so_far.saturating_add(downloaded);
+                report_launcher_update_download_progress(
+                    status_updater,
+                    downloaded_so_far,
+                    total_bytes,
+                    started_at,
+                    &mut last_reported_progress,
+                    &mut last_reported_at,
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    while let Ok(downloaded) = progress_receiver.try_recv() {
+        downloaded_so_far = downloaded_so_far.saturating_add(downloaded);
+    }
+
+    let mut completed_bytes = 0u64;
+    for worker in workers {
+        completed_bytes = completed_bytes.saturating_add(
+            worker
+                .join()
+                .map_err(|_| anyhow!("launcher update download worker panicked"))??,
+        );
+    }
+    if completed_bytes != total_bytes {
+        bail!(
+            "launcher update download incomplete: expected {} bytes, got {} bytes",
+            total_bytes,
+            completed_bytes
+        );
+    }
+
+    report_launcher_update_download_progress(
+        status_updater,
         total_bytes,
-        supports_ranges: true,
+        total_bytes,
+        started_at,
+        &mut last_reported_progress,
+        &mut last_reported_at,
+    );
+    let merged_bytes = merge_launcher_update_chunks(&chunk_paths, part_path)?;
+    if merged_bytes != total_bytes {
+        bail!(
+            "launcher update merge incomplete: expected {} bytes, got {} bytes",
+            total_bytes,
+            merged_bytes
+        );
+    }
+    Ok(merged_bytes)
+}
+
+fn download_launcher_update_range(
+    client: &Client,
+    url: &str,
+    range: LauncherUpdateByteRange,
+    chunk_path: &Path,
+    progress_sender: &mpsc::Sender<u64>,
+) -> Result<u64> {
+    let requested_range = format!("bytes={}-{}", range.start, range.end);
+    let mut response = client
+        .get(url)
+        .header(RANGE, requested_range)
+        .send()?
+        .error_for_status()?;
+    if response.status() != StatusCode::PARTIAL_CONTENT {
+        bail!(
+            "launcher update server ignored byte range {}-{}",
+            range.start,
+            range.end
+        );
+    }
+
+    let Some((start, end, _)) = response
+        .headers()
+        .get(CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_launcher_update_content_range)
+    else {
+        bail!("launcher update range response is missing a valid Content-Range header");
+    };
+    if start != range.start || end != range.end {
+        bail!(
+            "launcher update range response does not match requested bytes {}-{}",
+            range.start,
+            range.end
+        );
+    }
+
+    let expected_bytes = range.end - range.start + 1;
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length != expected_bytes)
+    {
+        bail!(
+            "launcher update range response has wrong length for bytes {}-{}",
+            range.start,
+            range.end
+        );
+    }
+
+    let mut file = fs::File::create(chunk_path)?;
+    let mut downloaded = 0u64;
+    let mut buffer = [0u8; 128 * 1024];
+    loop {
+        let size = response.read(&mut buffer)?;
+        if size == 0 {
+            break;
+        }
+        file.write_all(&buffer[..size])?;
+        downloaded += size as u64;
+        let _ = progress_sender.send(size as u64);
+    }
+    file.flush()?;
+
+    if downloaded != expected_bytes {
+        bail!(
+            "launcher update range download incomplete for bytes {}-{}: expected {} bytes, got {} bytes",
+            range.start,
+            range.end,
+            expected_bytes,
+            downloaded
+        );
+    }
+    Ok(downloaded)
+}
+
+fn merge_launcher_update_chunks(chunk_paths: &[PathBuf], part_path: &Path) -> Result<u64> {
+    let mut output = fs::File::create(part_path).with_context(|| {
+        t!(
+            "errors.write_update_failed",
+            error = part_path.display().to_string()
+        )
+    })?;
+    let mut written = 0u64;
+    for chunk_path in chunk_paths {
+        let mut chunk = fs::File::open(chunk_path)?;
+        written = written.saturating_add(std::io::copy(&mut chunk, &mut output)?);
+    }
+    output.flush().with_context(|| {
+        t!(
+            "errors.write_update_failed",
+            error = part_path.display().to_string()
+        )
+    })?;
+    Ok(written)
+}
+
+fn report_launcher_update_download_progress(
+    status_updater: &mut impl FnMut(SplashUpdate),
+    downloaded: u64,
+    total_bytes: u64,
+    started_at: Instant,
+    last_reported_progress: &mut u8,
+    last_reported_at: &mut Instant,
+) {
+    let (progress, detail) =
+        launcher_download_progress_detail(downloaded, Some(total_bytes), started_at);
+    if progress > *last_reported_progress
+        || last_reported_at.elapsed() >= Duration::from_millis(250)
+    {
+        *last_reported_progress = progress;
+        *last_reported_at = Instant::now();
+        status_updater(
+            SplashUpdate::loading(t!("launcher_update.updating"), detail, progress)
+                .with_subtitle(t!("launcher_update.status")),
+        );
     }
 }
 
-fn content_range_total_bytes(value: &str) -> Option<u64> {
-    value
-        .rsplit_once('/')
-        .and_then(|(_, total)| total.trim().parse::<u64>().ok())
-        .filter(|total| *total > 0)
+fn verify_and_promote_launcher_update(
+    part_path: &Path,
+    update_path: &Path,
+    expected_sha256: &str,
+) -> Result<u64> {
+    let digest_hex = sha256_file(part_path)?;
+    if !digest_hex.eq_ignore_ascii_case(expected_sha256) {
+        let _ = fs::remove_file(part_path);
+        bail!(
+            "launcher update sha256 mismatch: expected {}, got {}",
+            expected_sha256,
+            digest_hex
+        );
+    }
+
+    let downloaded = fs::metadata(part_path)?.len();
+    remove_launcher_update_file_if_exists(update_path)?;
+    fs::rename(part_path, update_path).with_context(|| {
+        format!(
+            "promote verified launcher update from {} to {}",
+            part_path.display(),
+            update_path.display()
+        )
+    })?;
+    Ok(downloaded)
+}
+
+fn launcher_update_part_path(update_path: &Path) -> PathBuf {
+    let Some(file_name) = update_path.file_name() else {
+        return update_path.with_extension("part");
+    };
+    let mut part_name = file_name.to_os_string();
+    part_name.push(".part");
+    update_path.with_file_name(part_name)
+}
+
+fn remove_launcher_update_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn cleanup_launcher_update_download_files(part_path: &Path, update_path: &Path) {
+    for path in [part_path, update_path] {
+        if let Err(error) = remove_launcher_update_file_if_exists(path) {
+            warn!(
+                "Unable to clean launcher update download {}: {error}",
+                path.display()
+            );
+        }
+    }
 }
 
 fn download_launcher_update_sequential(
@@ -660,7 +984,7 @@ fn download_launcher_update_sequential(
     })?;
     let mut downloaded = 0u64;
     let mut buffer = [0u8; 128 * 1024];
-    let mut last_reported_progress = 8u8;
+    let mut last_reported_progress = LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START;
     let mut last_reported_at = Instant::now() - Duration::from_secs(1);
     let download_started_at = Instant::now();
 
@@ -712,305 +1036,6 @@ fn download_launcher_update_sequential(
     Ok(downloaded)
 }
 
-fn download_launcher_update_parallel(
-    client: &Client,
-    url: &str,
-    update_path: &Path,
-    total_bytes: u64,
-    status_updater: &mut impl FnMut(SplashUpdate),
-) -> Result<u64> {
-    let worker_limit = launcher_update_parallel_threads();
-    let worker_count = launcher_update_worker_count(total_bytes, worker_limit);
-    let file = fs::File::create(update_path).with_context(|| {
-        t!(
-            "errors.write_update_failed",
-            error = update_path.display().to_string()
-        )
-    })?;
-    file.set_len(total_bytes).with_context(|| {
-        t!(
-            "errors.write_update_failed",
-            error = update_path.display().to_string()
-        )
-    })?;
-    drop(file);
-
-    info!(
-        "Downloading launcher update with {} dynamic range workers",
-        worker_count
-    );
-    let next_start = Arc::new(AtomicU64::new(0));
-    let downloaded = Arc::new(AtomicU64::new(0));
-    let cancel_requested = Arc::new(AtomicBool::new(false));
-    let started_at = Instant::now();
-    let (result_tx, result_rx) = mpsc::channel::<Result<()>>();
-
-    thread::scope(|scope| {
-        for index in 0..worker_count {
-            let client = client.clone();
-            let url = url.to_owned();
-            let update_path = update_path.to_path_buf();
-            let next_start = next_start.clone();
-            let downloaded = downloaded.clone();
-            let cancel_requested = cancel_requested.clone();
-            let result_tx = result_tx.clone();
-            scope.spawn(move || {
-                let result = download_launcher_update_worker(
-                    &client,
-                    &url,
-                    &update_path,
-                    total_bytes,
-                    worker_count,
-                    &next_start,
-                    &downloaded,
-                    &cancel_requested,
-                )
-                .with_context(|| format!("launcher update dynamic worker {} failed", index + 1));
-                let _ = result_tx.send(result);
-            });
-        }
-        drop(result_tx);
-        monitor_launcher_parallel_download(
-            total_bytes,
-            &downloaded,
-            &cancel_requested,
-            started_at,
-            worker_count,
-            &result_rx,
-            status_updater,
-        )
-    })
-}
-
-fn download_launcher_update_worker(
-    client: &Client,
-    url: &str,
-    update_path: &Path,
-    total_bytes: u64,
-    worker_count: usize,
-    next_start: &AtomicU64,
-    downloaded: &AtomicU64,
-    cancel_requested: &AtomicBool,
-) -> Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .open(update_path)
-        .with_context(|| {
-            t!(
-                "errors.write_update_failed",
-                error = update_path.display().to_string()
-            )
-        })?;
-    let mut buffer = [0u8; 128 * 1024];
-
-    while !cancel_requested.load(Ordering::Relaxed) {
-        let Some((start, end)) =
-            launcher_update_next_range(total_bytes, worker_count, next_start, downloaded)
-        else {
-            break;
-        };
-        download_launcher_update_range(
-            client,
-            url,
-            &mut file,
-            start,
-            end,
-            downloaded,
-            cancel_requested,
-            &mut buffer,
-        )
-        .with_context(|| format!("range bytes={start}-{end} failed"))?;
-    }
-
-    Ok(())
-}
-
-fn launcher_update_next_range(
-    total_bytes: u64,
-    worker_count: usize,
-    next_start: &AtomicU64,
-    downloaded: &AtomicU64,
-) -> Option<(u64, u64)> {
-    loop {
-        let start = next_start.load(Ordering::Relaxed);
-        if start >= total_bytes {
-            return None;
-        }
-
-        let chunk_size = launcher_update_chunk_size(
-            total_bytes,
-            start,
-            downloaded.load(Ordering::Relaxed),
-            worker_count,
-        );
-        let end = (start + chunk_size - 1).min(total_bytes - 1);
-        let next = end + 1;
-
-        if next_start
-            .compare_exchange(start, next, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            return Some((start, end));
-        }
-    }
-}
-
-fn launcher_update_chunk_size(
-    total_bytes: u64,
-    next_start: u64,
-    downloaded: u64,
-    worker_count: usize,
-) -> u64 {
-    let remaining_unassigned = total_bytes.saturating_sub(next_start);
-    if remaining_unassigned <= LAUNCHER_UPDATE_MIN_CHUNK_BYTES {
-        return remaining_unassigned.max(1);
-    }
-
-    let remaining_download = total_bytes.saturating_sub(downloaded);
-    let target_chunks = (worker_count as u64).saturating_mul(2).max(1);
-    let adaptive = remaining_download.div_ceil(target_chunks).clamp(
-        LAUNCHER_UPDATE_MIN_CHUNK_BYTES,
-        LAUNCHER_UPDATE_MAX_CHUNK_BYTES,
-    );
-
-    adaptive.min(remaining_unassigned).max(1)
-}
-
-fn download_launcher_update_range(
-    client: &Client,
-    url: &str,
-    file: &mut fs::File,
-    start: u64,
-    end: u64,
-    downloaded: &AtomicU64,
-    cancel_requested: &AtomicBool,
-    buffer: &mut [u8],
-) -> Result<()> {
-    let range = format!("bytes={start}-{end}");
-    let mut response = client
-        .get(url)
-        .header(RANGE, range)
-        .send()
-        .with_context(|| t!("errors.download_update_failed", url = url))?;
-
-    if response.status() != StatusCode::PARTIAL_CONTENT {
-        return Err(anyhow!(
-            "range request returned unexpected status: {}",
-            response.status()
-        ));
-    }
-
-    file.seek(SeekFrom::Start(start))
-        .with_context(|| t!("errors.write_update_failed", error = start.to_string()))?;
-
-    let expected_len = end - start + 1;
-    let mut written = 0u64;
-    while written < expected_len && !cancel_requested.load(Ordering::Relaxed) {
-        let size = response
-            .read(buffer)
-            .with_context(|| t!("errors.download_update_failed", url = url))?;
-        if size == 0 {
-            break;
-        }
-
-        let remaining = (expected_len - written) as usize;
-        if size > remaining {
-            return Err(anyhow!(
-                "range response exceeded expected length: expected {} bytes, got at least {} bytes",
-                expected_len,
-                written + size as u64
-            ));
-        }
-
-        file.write_all(&buffer[..size])
-            .with_context(|| t!("errors.write_update_failed", error = start.to_string()))?;
-        written += size as u64;
-        downloaded.fetch_add(size as u64, Ordering::Relaxed);
-    }
-
-    if cancel_requested.load(Ordering::Relaxed) {
-        return Ok(());
-    }
-
-    if written != expected_len {
-        return Err(anyhow!(
-            "range response incomplete: expected {} bytes, got {} bytes",
-            expected_len,
-            written
-        ));
-    }
-
-    Ok(())
-}
-
-fn monitor_launcher_parallel_download(
-    total_bytes: u64,
-    downloaded: &AtomicU64,
-    cancel_requested: &AtomicBool,
-    started_at: Instant,
-    worker_count: usize,
-    result_rx: &mpsc::Receiver<Result<()>>,
-    status_updater: &mut impl FnMut(SplashUpdate),
-) -> Result<u64> {
-    let mut finished_workers = 0usize;
-    let mut last_reported_progress = 8u8;
-    let mut last_reported_at = Instant::now() - Duration::from_secs(1);
-
-    while finished_workers < worker_count {
-        match result_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(Ok(())) => finished_workers += 1,
-            Ok(Err(err)) => {
-                cancel_requested.store(true, Ordering::Relaxed);
-                return Err(err);
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                cancel_requested.store(true, Ordering::Relaxed);
-                return Err(anyhow!("launcher update worker channel disconnected"));
-            }
-        }
-
-        let current = downloaded.load(Ordering::Relaxed).min(total_bytes);
-        let (progress, detail) =
-            launcher_download_progress_detail(current, Some(total_bytes), started_at);
-        if progress > last_reported_progress
-            || last_reported_at.elapsed() >= Duration::from_millis(250)
-        {
-            last_reported_progress = progress;
-            last_reported_at = Instant::now();
-            status_updater(
-                SplashUpdate::loading(t!("launcher_update.updating"), detail, progress)
-                    .with_subtitle(t!("launcher_update.status")),
-            );
-        }
-    }
-
-    let downloaded = downloaded.load(Ordering::Relaxed);
-    if downloaded != total_bytes {
-        return Err(anyhow!(
-            "launcher update download incomplete: expected {} bytes, got {} bytes",
-            total_bytes,
-            downloaded
-        ));
-    }
-
-    Ok(downloaded)
-}
-
-fn launcher_update_parallel_threads() -> usize {
-    thread::available_parallelism()
-        .map(|parallelism| parallelism.get().saturating_mul(2))
-        .unwrap_or(16)
-        .clamp(16, 128)
-}
-
-fn launcher_update_worker_count(total_bytes: u64, max_workers: usize) -> usize {
-    total_bytes
-        .div_ceil(LAUNCHER_UPDATE_MIN_CHUNK_BYTES)
-        .max(1)
-        .min(max_workers as u64) as usize
-}
-
 fn sha256_file(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -1035,7 +1060,7 @@ fn launcher_download_progress_detail(
 ) -> (u8, String) {
     let speed = format_speed(download_speed_bytes_per_second(downloaded, started_at));
     if let Some(total) = total_bytes.filter(|total| *total > 0) {
-        let percentage = ((downloaded.min(total) * 100) / total) as u8;
+        let percentage = (downloaded.min(total).saturating_mul(100) / total) as u8;
         let detail = t!(
             "launcher_update.downloading_detail",
             downloaded = format_bytes(downloaded),
@@ -1044,11 +1069,19 @@ fn launcher_download_progress_detail(
             speed = speed
         )
         .to_string();
-        return (percentage, detail);
+        let progress_span =
+            LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_END - LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START;
+        let progress = LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START
+            + ((u16::from(percentage) * u16::from(progress_span)) / 100) as u8;
+        return (progress, detail);
     }
 
     let mib_downloaded = downloaded / (1024 * 1024);
-    let progress = (12 + mib_downloaded.min(76) as u8).min(88);
+    let progress = (LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START
+        + mib_downloaded.min(u64::from(
+            LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_END - LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START,
+        )) as u8)
+        .min(LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_END);
     let detail = t!(
         "launcher_update.downloading_detail_unknown",
         downloaded = format_bytes(downloaded),
@@ -1097,19 +1130,30 @@ fn launcher_update_platform_key() -> &'static str {
     }
 }
 
-fn launcher_version_is_newer(current: &str, latest: &str) -> bool {
-    let current = parse_launcher_version(current);
-    let latest = parse_launcher_version(latest);
-    latest > current
+fn launcher_version_is_newer(current: &str, latest: &str) -> Option<bool> {
+    let current = parse_launcher_version(current)?;
+    let latest = parse_launcher_version(latest)?;
+    Some(latest > current)
 }
 
-fn parse_launcher_version(version: &str) -> (u64, u64, u64, u64) {
+fn parse_launcher_version(version: &str) -> Option<(u64, u64, u64, u64)> {
     let version = version.strip_prefix('v').unwrap_or(version);
+    let version = match version.split_once('+') {
+        Some((version, build_metadata)) if valid_launcher_version_suffix(build_metadata) => version,
+        Some(_) => return None,
+        None => version,
+    };
     let (core, suffix) = version.split_once('-').unwrap_or((version, ""));
-    let mut nums = core.split('.').map(|part| part.parse::<u64>().unwrap_or(0));
-    let major = nums.next().unwrap_or(0);
-    let minor = nums.next().unwrap_or(0);
-    let patch = nums.next().unwrap_or(0);
+    if version.contains('-') && !valid_launcher_version_suffix(suffix) {
+        return None;
+    }
+    let mut nums = core.split('.');
+    let major = nums.next()?.parse::<u64>().ok()?;
+    let minor = nums.next()?.parse::<u64>().ok()?;
+    let patch = nums.next()?.parse::<u64>().ok()?;
+    if nums.next().is_some() {
+        return None;
+    }
     let suffix_rank = suffix
         .chars()
         .rev()
@@ -1120,7 +1164,17 @@ fn parse_launcher_version(version: &str) -> (u64, u64, u64, u64) {
         .collect::<String>()
         .parse::<u64>()
         .unwrap_or(0);
-    (major, minor, patch, suffix_rank)
+    Some((major, minor, patch, suffix_rank))
+}
+
+fn valid_launcher_version_suffix(value: &str) -> bool {
+    !value.is_empty()
+        && value.split('.').all(|identifier| {
+            !identifier.is_empty()
+                && identifier
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        })
 }
 
 fn launcher_arg_present(flags: &[&str]) -> bool {
@@ -1363,11 +1417,368 @@ mod tests {
     fn test_english_splash_i18n_uses_json_literals() {
         rust_i18n::set_locale("en");
 
-        let html = splash_redesigned_shell_html("light", "dark");
+        let html = splash_redesigned_shell_html("video", "font");
 
         assert!(html.contains(r#""defaultTip":"Sakura Empire's cherry blossoms"#));
         assert!(!html.contains("const defaultTip = '"));
         assert!(html.contains("window.__ALAS_SPLASH_READY = true;"));
+        assert!(html.contains("data:video/mp4;base64,video"));
+        assert!(html.contains("font-family: \"MiSans\""));
+        assert!(html.contains("data:font/ttf;base64,font"));
+        assert!(!html.contains("text-transform: uppercase;"));
+    }
+
+    #[test]
+    fn test_splash_includes_optional_uv_progress() {
+        let html = splash_redesigned_shell_html("video", "font");
+
+        assert!(html.contains("id=\"uv-progress-container\""));
+        assert!(html.contains("payload.uv_progress"));
+        assert!(html.contains("id=\"uv-progress-detail\""));
+    }
+
+    #[test]
+    fn test_truncate_log_file_replaces_existing_contents() {
+        let temp_dir = TempDirBuilder::new()
+            .prefix("launcher-log-truncate-test-")
+            .tempdir()
+            .expect("create temporary log directory");
+        let filename = "launcher.txt";
+        let path = temp_dir.path().join(filename);
+        fs::write(&path, "old launcher log").expect("write old log");
+
+        truncate_log_file(temp_dir.path(), filename).expect("truncate launcher log");
+
+        assert_eq!(fs::read(&path).expect("read truncated log"), b"");
+    }
+
+    #[test]
+    fn test_titlebars_use_webview_draggable_regions_for_touch_dragging() {
+        let splash_html = splash_redesigned_shell_html("video", "font");
+
+        assert!(splash_html.contains("touch-action: none;"));
+        assert!(splash_html.contains("addEventListener('pointerdown'"));
+        assert!(splash_html.contains("-webkit-app-region: drag;"));
+        assert!(splash_html.contains("-webkit-app-region: no-drag;"));
+        assert!(splash_html.contains("webviewDraggableRegionsEnabled"));
+        assert!(splash_html.contains("if (webviewDraggableRegionsEnabled) {"));
+        assert!(!splash_html.contains("$NATIVE_TOUCH_DRAG"));
+
+        #[cfg(windows)]
+        assert!(splash_html.contains("const webviewDraggableRegionsEnabled = true;"));
+
+        #[cfg(not(target_os = "macos"))]
+        let titlebar_script = main_window_titlebar_injection_script();
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(titlebar_script.contains("touch-action:none"));
+            assert!(titlebar_script.contains("addEventListener('pointerdown'"));
+            assert!(titlebar_script.contains("-webkit-app-region:drag"));
+            assert!(titlebar_script.contains("-webkit-app-region:no-drag"));
+            assert!(titlebar_script.contains("webviewDraggableRegionsEnabled"));
+            assert!(titlebar_script.contains("if (webviewDraggableRegionsEnabled)"));
+            assert!(titlebar_script.contains("min-height:12px"));
+            assert!(titlebar_script.contains("alas-close-menu"));
+            assert!(!titlebar_script.contains("alas-close-optics"));
+            assert!(!titlebar_script.contains("alas-island-open"));
+            assert!(titlebar_script.contains("__ALAS_OPEN_CLOSE_PROMPT"));
+            assert!(titlebar_script.contains("window_exit_application"));
+            #[cfg(windows)]
+            assert!(titlebar_script.contains("const webviewDraggableRegionsEnabled = true;"));
+        }
+    }
+
+    #[test]
+    fn test_windows_enable_webview_draggable_regions() {
+        let config: serde_json::Value =
+            serde_json::from_str(TAURI_CONFIG_SOURCE).expect("valid config");
+        let windows = config["app"]["windows"].as_array().expect("window configs");
+
+        for window in windows {
+            let args = window["additionalBrowserArgs"]
+                .as_str()
+                .expect("draggable regions arguments");
+            assert!(args.contains("msWebView2EnableDraggableRegions"));
+            assert!(args.contains("ElasticOverscroll"));
+            assert!(args.contains("msWebOOUI,msPdfOOUI,msSmartScreenProtection"));
+            assert!(args.contains("--no-proxy-server"));
+        }
+    }
+
+    #[test]
+    fn test_launcher_update_versions_must_be_valid() {
+        assert_eq!(launcher_version_is_newer("2.1.6", "2.1.7"), Some(true));
+        assert_eq!(
+            launcher_version_is_newer("2.1.6", "2.1.6+build.1"),
+            Some(false)
+        );
+        assert_eq!(launcher_version_is_newer("2.1.6", "not-a-version"), None);
+        assert_eq!(launcher_version_is_newer("2.1", "2.1.7"), None);
+        assert_eq!(launcher_version_is_newer("2.1.6", "2.1.7-"), None);
+    }
+
+    #[test]
+    fn test_launcher_update_manifest_uses_fallback_url() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = std::thread::spawn(move || {
+            let fallback_body = r#"{"version":"2.1.8","platforms":{}}"#;
+            let responses = [
+                (
+                    "/primary",
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_owned(),
+                ),
+                (
+                    "/fallback",
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{fallback_body}",
+                        fallback_body.len()
+                    ),
+                ),
+            ];
+
+            for (expected_path, response) in responses {
+                let (mut stream, _) = listener.accept().expect("accept manifest request");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("set read timeout");
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0u8; 1024];
+                    let read = stream.read(&mut buffer).expect("read manifest request");
+                    assert!(read > 0, "manifest request ended before headers");
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                assert!(request.starts_with(&format!("GET {expected_path} ")));
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write manifest response");
+            }
+        });
+
+        let client = Client::builder().no_proxy().build().expect("build client");
+        let primary = format!("http://{address}/primary");
+        let fallback = format!("http://{address}/fallback");
+        let manifest = fetch_launcher_update_manifest_from_urls(&client, &[&primary, &fallback])
+            .expect("fetch manifest from fallback");
+
+        assert_eq!(manifest.version, "2.1.8");
+        server.join().expect("manifest server completed");
+    }
+
+    #[test]
+    fn test_launcher_update_payload_requires_https_and_sha256() {
+        let digest = "a".repeat(64);
+
+        assert!(
+            validate_launcher_update_payload("https://updates.example/launcher", &digest).is_ok()
+        );
+        assert!(
+            validate_launcher_update_payload("http://updates.example/launcher", &digest).is_err()
+        );
+        assert!(validate_launcher_update_payload(
+            "https://updates.example/launcher",
+            "not-a-digest"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_launcher_update_byte_ranges_cover_payload_once() {
+        let total_bytes = LAUNCHER_UPDATE_MIN_CHUNK_BYTES * 8 + 17;
+        let ranges = launcher_update_byte_ranges(total_bytes);
+
+        assert_eq!(ranges.len(), LAUNCHER_UPDATE_MAX_CONNECTIONS);
+        assert_eq!(ranges.first().map(|range| range.start), Some(0));
+        assert_eq!(ranges.last().map(|range| range.end), Some(total_bytes - 1));
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|range| range.end - range.start + 1)
+                .sum::<u64>(),
+            total_bytes
+        );
+        assert!(ranges
+            .windows(2)
+            .all(|pair| pair[0].end + 1 == pair[1].start));
+    }
+
+    #[test]
+    fn test_launcher_update_content_range_parser() {
+        assert_eq!(
+            parse_launcher_update_content_range("bytes 10-19/42"),
+            Some((10, 19, 42))
+        );
+        assert_eq!(parse_launcher_update_content_range("bytes 0-0/*"), None);
+        assert_eq!(parse_launcher_update_content_range("bytes 19-10/42"), None);
+        assert_eq!(parse_launcher_update_content_range("not-a-range"), None);
+    }
+
+    #[test]
+    fn test_launcher_update_range_probe_falls_back_when_ignored() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept range probe");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set read timeout");
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0u8; 1024];
+                let read = stream.read(&mut buffer).expect("read range probe");
+                assert!(read > 0, "range probe ended before headers");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            assert!(String::from_utf8_lossy(&request)
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("range: bytes=0-0")));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("write range probe response");
+        });
+
+        let client = Client::builder().no_proxy().build().expect("build client");
+        let url = format!("http://{address}/launcher");
+        assert_eq!(
+            launcher_update_range_total(&client, &url).expect("probe range support"),
+            None
+        );
+        server.join().expect("range probe server completed");
+    }
+
+    #[test]
+    fn test_parallel_launcher_update_download_merges_ranges() {
+        let payload: Vec<u8> = (0..(LAUNCHER_UPDATE_MIN_CHUNK_BYTES * 2 + 17))
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let payload = Arc::new(payload);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let request_count = launcher_update_byte_ranges(payload.len() as u64).len() + 1;
+        let server_payload = Arc::clone(&payload);
+        let server = std::thread::spawn(move || {
+            for _ in 0..request_count {
+                let (mut stream, _) = listener.accept().expect("accept range request");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("set read timeout");
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0u8; 1024];
+                    let read = stream.read(&mut buffer).expect("read range request");
+                    assert!(read > 0, "range request ended before headers");
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+
+                let request = String::from_utf8_lossy(&request);
+                let range = request
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if name.eq_ignore_ascii_case("range") {
+                            value.trim().strip_prefix("bytes=")
+                        } else {
+                            None
+                        }
+                    })
+                    .expect("range request header");
+                let (start, end) = range.split_once('-').expect("range bounds");
+                let start: usize = start.parse().expect("range start");
+                let end: usize = end.parse().expect("range end");
+                assert!(start <= end && end < server_payload.len());
+                let body = &server_payload[start..=end];
+                let response = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
+                    body.len(),
+                    start,
+                    end,
+                    server_payload.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write headers");
+                stream.write_all(body).expect("write range body");
+            }
+        });
+
+        let client = Client::builder().no_proxy().build().expect("build client");
+        let url = format!("http://{address}/launcher");
+        let temp_dir = TempDirBuilder::new()
+            .prefix("launcher-range-test-")
+            .tempdir()
+            .unwrap();
+        let part_path = temp_dir.path().join("launcher.part");
+        let total_bytes = launcher_update_range_total(&client, &url)
+            .expect("probe range support")
+            .expect("server supports ranges");
+        let ranges = launcher_update_byte_ranges(total_bytes);
+        let mut progress = Vec::new();
+
+        let downloaded = download_launcher_update_parallel(
+            &client,
+            &url,
+            total_bytes,
+            &ranges,
+            &part_path,
+            &mut |update| progress.push(update.progress),
+        )
+        .expect("parallel launcher download");
+
+        assert_eq!(downloaded, payload.len() as u64);
+        let merged = fs::read(&part_path).expect("read merged file");
+        assert_eq!(merged.as_slice(), payload.as_slice());
+        assert!(progress
+            .iter()
+            .any(|value| *value > LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START));
+        server.join().expect("range server completed");
+    }
+
+    #[test]
+    fn test_launcher_update_promotion_requires_valid_digest() {
+        let temp_dir = TempDirBuilder::new()
+            .prefix("launcher-promotion-test-")
+            .tempdir()
+            .unwrap();
+        let part_path = temp_dir.path().join("launcher.part");
+        let update_path = temp_dir.path().join("launcher.update");
+        fs::write(&part_path, b"verified update").expect("write update part");
+        let digest = sha256_file(&part_path).expect("hash update part");
+
+        assert_eq!(
+            verify_and_promote_launcher_update(&part_path, &update_path, &digest)
+                .expect("promote verified update"),
+            b"verified update".len() as u64
+        );
+        assert!(!part_path.exists());
+        assert_eq!(
+            fs::read(&update_path).expect("read promoted update"),
+            b"verified update"
+        );
+
+        let failed_part_path = temp_dir.path().join("failed.part");
+        let failed_update_path = temp_dir.path().join("failed.update");
+        fs::write(&failed_part_path, b"unverified update").expect("write failed update part");
+        assert!(verify_and_promote_launcher_update(
+            &failed_part_path,
+            &failed_update_path,
+            &"0".repeat(64),
+        )
+        .is_err());
+        assert!(!failed_part_path.exists());
+        assert!(!failed_update_path.exists());
     }
 }
 
@@ -1739,11 +2150,58 @@ fn main() -> Result<()> {
                                 crate::setup::get_tip()
                             )),
                         );
-                        let b = match ManagedBackend::new(&webui_config) {
+                        let mut backend_recovery_used = false;
+                        let backend_result = loop {
+                            match ManagedBackend::new(&webui_config) {
+                                Ok(backend) => break Ok(backend),
+                                Err(error)
+                                    if !backend_recovery_used
+                                        && is_backend_startup_timeout(&error) =>
+                                {
+                                    backend_recovery_used = true;
+                                    if setup_cancel_requested.load(Ordering::SeqCst) {
+                                        break Err(error);
+                                    }
+
+                                    warn!(
+                                        "Backend startup timed out; rebuilding .venv and retrying once"
+                                    );
+                                    if let Err(recovery_error) = rebuild_venv_and_sync_dependencies(
+                                        &mut status_updater,
+                                        setup_cancel_requested.clone(),
+                                    ) {
+                                        break Err(recovery_error.context(
+                                            "Failed to rebuild .venv after backend startup timeout",
+                                        ));
+                                    }
+
+                                    info!(
+                                        "Retrying gui.py after rebuilding dependencies on http://127.0.0.1:{port}/"
+                                    );
+                                    status_updater(
+                                        SplashUpdate::loading(
+                                            t!("splash.starting"),
+                                            t!("splash.webui_init_slow"),
+                                            97,
+                                        )
+                                        .with_subtitle(format!(
+                                            "{} | Tips:{}",
+                                            t!("splash.starting_backend"),
+                                            crate::setup::get_tip()
+                                        )),
+                                    );
+                                }
+                                Err(error) => break Err(error),
+                            }
+                        };
+                        let b = match backend_result {
                             Ok(backend) => backend,
                             Err(e) => {
                                 error!("{e}");
                                 setup_running.store(false, Ordering::SeqCst);
+                                if setup_cancel_requested.load(Ordering::SeqCst) {
+                                    return;
+                                }
                                 if start_minimized {
                                     let _ = reveal_window(&splash);
                                 }
@@ -1908,9 +2366,10 @@ fn main() -> Result<()> {
 }
 
 fn initialize_logging() -> Result<WorkerGuard> {
-    fs::create_dir_all("log")?;
+    let log_dir = Path::new("log");
     let log_filename = today_launcher_log_filename();
-    let file_appender = tracing_appender::rolling::never("log", log_filename);
+    truncate_log_file(log_dir, &log_filename)?;
+    let file_appender = tracing_appender::rolling::never(log_dir, log_filename);
     let (non_blocking_file, guard) = tracing_appender::non_blocking(file_appender);
 
     let file_layer = tracing_subscriber::fmt::layer()
@@ -1928,6 +2387,14 @@ fn initialize_logging() -> Result<WorkerGuard> {
         .init();
 
     Ok(guard)
+}
+
+fn truncate_log_file(log_dir: &Path, filename: &str) -> Result<()> {
+    fs::create_dir_all(log_dir)?;
+    let path = log_dir.join(filename);
+    fs::File::create(&path)
+        .with_context(|| format!("truncate launcher log file {}", path.display()))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -2051,11 +2518,29 @@ fn window_is_maximized(window: WebviewWindow) -> tauri::Result<bool> {
 }
 
 #[tauri::command]
-fn retry_backend_connection(window: WebviewWindow, port: u16) -> std::result::Result<bool, String> {
-    navigate_backend_or_error(&window, port).map_err(|e| {
-        error!("Failed to retry backend connection: {:?}", e);
-        e.to_string()
+async fn retry_backend_connection(
+    window: WebviewWindow,
+    port: u16,
+) -> std::result::Result<bool, String> {
+    let connected = tauri::async_runtime::spawn_blocking(move || {
+        wait_for_backend_connection(port, BACKEND_NAVIGATION_TIMEOUT).is_ok()
     })
+    .await
+    .map_err(|e| {
+        error!("Backend retry task failed: {e:?}");
+        e.to_string()
+    })?;
+
+    if !connected {
+        return Ok(false);
+    }
+
+    let url = Url::parse(&backend_url(port)).map_err(|e| e.to_string())?;
+    window.navigate(url).map_err(|e| {
+        error!("Failed to navigate to reconnected backend: {e:?}");
+        e.to_string()
+    })?;
+    Ok(true)
 }
 
 fn page_load_injector(webview: WebviewWindow, payload: PageLoadPayload<'_>) {
@@ -2160,14 +2645,14 @@ fn backend_url(port: u16) -> String {
 }
 
 fn splash_response() -> tauri::http::Response<Vec<u8>> {
-    let light_bg_b64 = BASE64_STANDARD.encode(SPLASH_BG_LIGHT);
-    let dark_bg_b64 = BASE64_STANDARD.encode(SPLASH_BG_DARK);
+    let video_bg_b64 = BASE64_STANDARD.encode(SPLASH_BG_VIDEO);
+    let mi_sans_font_b64 = BASE64_STANDARD.encode(MI_SANS_FONT);
     tauri::http::Response::builder()
         .header(
             tauri::http::header::CONTENT_TYPE,
             "text/html; charset=utf-8",
         )
-        .body(splash_redesigned_shell_html(&light_bg_b64, &dark_bg_b64).into_bytes())
+        .body(splash_redesigned_shell_html(&video_bg_b64, &mi_sans_font_b64).into_bytes())
         .unwrap()
 }
 
@@ -2304,6 +2789,8 @@ fn escape_html(input: impl AsRef<str>) -> String {
 fn backend_error_html(port: u16, error_detail: &str) -> String {
     let backend_url_json = to_string(&backend_url(port)).unwrap();
     let error_detail_json = to_string(error_detail).unwrap();
+    let mi_sans_font_b64 = BASE64_STANDARD.encode(MI_SANS_FONT);
+    let splash_video_b64 = BASE64_STANDARD.encode(SPLASH_BG_VIDEO);
     let titlebar_script = main_window_titlebar_injection_script();
     let i18n = serde_json::json!({
         "title": t!("error_page.title"),
@@ -2331,165 +2818,298 @@ fn backend_error_html(port: u16, error_detail: &str) -> String {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
 <style>
+  @font-face {{
+    font-family: "MiSans";
+    src: url(data:font/ttf;base64,{mi_sans_font_b64}) format("truetype");
+    font-weight: 100 900;
+    font-style: normal;
+    font-display: swap;
+  }}
   :root {{
     color-scheme: light;
-    --bg: #f5f7fb;
-    --panel: #ffffff;
-    --border: #d9e2ee;
-    --text: #182230;
-    --muted: #5f6f84;
-    --danger: #c03434;
-    --danger-bg: #fff1f1;
-    --primary: #1f66ad;
-    --primary-hover: #18558f;
+    --bg: #f4f6f8;
+    --surface: #ffffff;
+    --surface-soft: #f8fafb;
+    --line: #e5e9ee;
+    --text: #17212b;
+    --muted: #687582;
+    --accent: #176b67;
+    --accent-hover: #105854;
+    --accent-soft: #e8f4f2;
+    --danger: #b64545;
+    --danger-soft: #fff1f0;
   }}
   * {{
     box-sizing: border-box;
   }}
   html, body {{
+    width: 100%;
     min-height: 100%;
     margin: 0;
-    font-family: "Segoe UI", "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+    font-family: "MiSans", sans-serif;
+    font-weight: 420;
+    font-synthesis: none;
     color: var(--text);
-    background: var(--bg);
+    background: #dfe7ea;
   }}
   body {{
-    display: grid;
-    place-items: center;
-    padding: 72px 28px 32px;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 72px 44px 44px;
+    position: relative;
+    isolation: isolate;
+    overflow: hidden;
+    background: transparent;
+    animation: page-in 420ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }}
+  .error-background-video {{
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    opacity: 0.9;
+    pointer-events: none;
+  }}
+  .error-background-scrim {{
+    position: fixed;
+    inset: 0;
+    z-index: 1;
+    background: rgba(244, 247, 248, 0.36);
+    pointer-events: none;
   }}
   .panel {{
-    width: min(680px, 100%);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    background: var(--panel);
-    box-shadow: 0 18px 44px rgba(21, 35, 54, 0.10);
-    padding: 32px;
+    position: relative;
+    z-index: 2;
+    display: grid;
+    grid-template-columns: 190px minmax(0, 1fr);
+    width: min(820px, 100%);
+    min-height: 390px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.76);
+    backdrop-filter: blur(22px) saturate(1.08);
+    box-shadow: 0 20px 48px rgba(23, 33, 43, 0.11), 0 2px 6px rgba(23, 33, 43, 0.04);
+    animation: panel-in 520ms cubic-bezier(0.22, 1, 0.36, 1) 70ms both;
   }}
-  .mark {{
-    width: 38px;
-    height: 38px;
-    border-radius: 8px;
+  .signal {{
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--accent);
+    color: #fff;
+  }}
+  .signal::before, .signal::after {{
+    content: "";
+    position: absolute;
+    border: 1px solid rgba(255, 255, 255, 0.17);
+    border-radius: 50%;
+    opacity: 0;
+    animation: signal-expand 3.2s ease-out infinite;
+  }}
+  .signal::before {{ width: 76px; height: 76px; }}
+  .signal::after {{ width: 76px; height: 76px; animation-delay: 1.6s; }}
+  .signal-core {{
+    position: relative;
+    z-index: 1;
+    width: 76px;
+    height: 76px;
     display: grid;
     place-items: center;
-    background: var(--danger-bg);
-    color: var(--danger);
-    border: 1px solid #f0caca;
-    font-size: 24px;
-    line-height: 1;
-    font-weight: 600;
-    margin-bottom: 20px;
+    border: 1px solid rgba(255, 255, 255, 0.45);
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.12);
+    animation: core-breathe 2.8s ease-in-out infinite;
+  }}
+  .signal-core svg {{
+    width: 36px;
+    height: 36px;
+    fill: none;
+    stroke: currentColor;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 1.7;
+  }}
+  .content {{
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    padding: 38px 42px 32px;
+    animation: content-in 500ms cubic-bezier(0.22, 1, 0.36, 1) 140ms both;
+  }}
+  .eyebrow {{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 620;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+  }}
+  .eyebrow::before {{
+    content: "";
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--danger);
+    box-shadow: 0 0 0 4px var(--danger-soft);
+    animation: status-pulse 2s ease-in-out infinite;
   }}
   h1 {{
-    margin: 0;
-    font-size: 28px;
-    font-weight: 600;
-    line-height: 1.2;
+    max-width: 470px;
+    margin: 16px 0 0;
+    font-size: 30px;
+    font-weight: 680;
+    letter-spacing: -0.3px;
+    line-height: 1.18;
   }}
   .lead {{
+    max-width: 510px;
     margin: 12px 0 0;
     color: var(--muted);
-    font-size: 15px;
-    line-height: 1.7;
+    font-size: 14px;
+    font-weight: 430;
+    line-height: 1.65;
   }}
   .details {{
     margin: 24px 0 0;
-    border: 1px solid var(--border);
+    border: 1px solid var(--line);
     border-radius: 8px;
     overflow: hidden;
-    background: #fbfdff;
+    background: var(--surface-soft);
   }}
   .row {{
     display: grid;
-    grid-template-columns: 72px minmax(0, 1fr);
+    grid-template-columns: 70px minmax(0, 1fr);
     gap: 14px;
-    padding: 13px 16px;
-    border-top: 1px solid var(--border);
-    font-size: 13px;
-    line-height: 1.55;
+    padding: 10px 13px;
+    border-top: 1px solid var(--line);
+    font-size: 12px;
+    font-weight: 460;
+    line-height: 1.5;
   }}
-  .row:first-child {{
-    border-top: 0;
-  }}
-  .label {{
-    color: var(--muted);
-  }}
+  .row:first-child {{ border-top: 0; }}
+  .label {{ color: var(--muted); }}
   .value {{
     min-width: 0;
     overflow-wrap: anywhere;
-    font-family: Consolas, "SFMono-Regular", Menlo, monospace;
+    color: var(--text);
+    font-family: inherit;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
   }}
   .actions {{
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 9px;
     flex-wrap: wrap;
-    margin-top: 24px;
+    margin-top: auto;
+    padding-top: 24px;
   }}
-  .action-button {{
-    min-height: 38px;
+  button {{
+    min-height: 36px;
     border: 1px solid transparent;
-    border-radius: 6px;
-    padding: 0 16px;
+    border-radius: 7px;
+    padding: 0 13px;
     font: inherit;
-    font-size: 14px;
+    font-size: 12px;
+    font-weight: 600;
     cursor: pointer;
-    color: #ffffff;
-    background: var(--primary);
+    transition: background 140ms ease, border-color 140ms ease, color 140ms ease, opacity 140ms ease;
+    will-change: transform;
   }}
-  .action-button:hover {{
-    background: var(--primary-hover);
+  button:hover {{ transform: translateY(-1px); }}
+  button:active {{ transform: translateY(0); }}
+  .action-button {{
+    color: #fff;
+    background: var(--accent);
   }}
-  .action-button:disabled {{
-    cursor: default;
-    opacity: 0.65;
+  .action-button:hover {{ background: var(--accent-hover); }}
+  .secondary-button {{
+    color: var(--accent);
+    border-color: #c5dfdc;
+    background: var(--accent-soft);
   }}
+  .secondary-button:hover {{ background: #dcefeb; border-color: #a8d2cd; }}
+  button:disabled {{ cursor: default; opacity: 0.55; }}
+  button:disabled:hover {{ transform: none; }}
   .status {{
-    min-height: 20px;
+    flex: 1 1 100%;
+    min-height: 18px;
     color: var(--muted);
-    font-size: 13px;
+    font-size: 12px;
+    font-weight: 460;
   }}
-  @media (max-width: 560px) {{
-    body {{
-      padding: 64px 16px 22px;
-      place-items: start stretch;
-    }}
-    .panel {{
-      padding: 24px;
-    }}
-    h1 {{
-      font-size: 23px;
-    }}
-    .row {{
-      grid-template-columns: 1fr;
-      gap: 4px;
-    }}
-    .action-button {{
-      width: 100%;
-    }}
+  .footer {{
+    margin-top: 16px;
+    color: #9aa5ae;
+    font-size: 11px;
+    font-weight: 430;
+  }}
+  @media (max-width: 680px) {{
+    body {{ padding: 62px 18px 24px; align-items: flex-start; }}
+    .panel {{ grid-template-columns: 1fr; min-height: 0; }}
+    .signal {{ min-height: 120px; }}
+    .signal::before {{ width: 76px; height: 76px; }}
+    .signal::after {{ width: 76px; height: 76px; }}
+    .content {{ padding: 28px 24px 24px; }}
+    h1 {{ font-size: 25px; }}
+    .actions {{ margin-top: 22px; }}
+    button {{ flex: 1 1 auto; }}
+  }}
+  @media (max-width: 420px) {{
+    .row {{ grid-template-columns: 1fr; gap: 3px; }}
+    button {{ width: 100%; }}
+  }}
+  @keyframes page-in {{ from {{ opacity: 0; }} to {{ opacity: 1; }} }}
+  @keyframes panel-in {{ from {{ opacity: 0; transform: translateY(12px) scale(0.985); }} to {{ opacity: 1; transform: translateY(0) scale(1); }} }}
+  @keyframes content-in {{ from {{ opacity: 0; transform: translateX(10px); }} to {{ opacity: 1; transform: translateX(0); }} }}
+  @keyframes signal-expand {{ 0% {{ opacity: 0.72; transform: scale(0.72); }} 68% {{ opacity: 0.12; }} 100% {{ opacity: 0; transform: scale(2.8); }} }}
+  @keyframes core-breathe {{ 0%, 100% {{ transform: scale(1); }} 50% {{ transform: scale(1.045); }} }}
+  @keyframes status-pulse {{ 0%, 100% {{ opacity: 0.62; }} 50% {{ opacity: 1; }} }}
+  @media (prefers-reduced-motion: reduce) {{
+    *, *::before, *::after {{ animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }}
   }}
 </style>
 </head>
 <body>
+  <video class="error-background-video" autoplay muted loop playsinline preload="auto" aria-hidden="true">
+    <source src="data:video/mp4;base64,{splash_video_b64}" type="video/mp4">
+  </video>
+  <div class="error-background-scrim" aria-hidden="true"></div>
   <main class="panel">
-    <div class="mark">!</div>
-    <h1>{heading}</h1>
-    <p class="lead">{description}</p>
-    <section class="details" aria-label="{connection_info}">
-      <div class="row">
-        <div class="label">{address}</div>
-        <div id="backend-url" class="value"></div>
+    <div class="signal" aria-hidden="true">
+      <div class="signal-core">
+        <svg viewBox="0 0 24 24"><path d="M12 8v4m0 4h.01"/><path d="M10.3 3.9 2.8 17a2 2 0 0 0 1.7 3h15a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg>
       </div>
-      <div class="row">
-        <div class="label">{error_label}</div>
-        <div id="error-detail" class="value"></div>
+    </div>
+    <div class="content">
+      <div class="eyebrow">{error_label}</div>
+      <h1>{heading}</h1>
+      <p class="lead">{description}</p>
+      <section class="details" aria-label="{connection_info}">
+        <div class="row">
+          <div class="label">{address}</div>
+          <div id="backend-url" class="value"></div>
+        </div>
+        <div class="row">
+          <div class="label">{error_label}</div>
+          <div id="error-detail" class="value"></div>
+        </div>
+      </section>
+      <div class="actions">
+        <button id="retry-button" class="action-button" type="button">{retry}</button>
+        <button id="gui-log-button" class="secondary-button" type="button">{download_gui_log}</button>
+        <button id="launcher-log-button" class="secondary-button" type="button">{download_launcher_log}</button>
+        <span id="retry-status" class="status"></span>
       </div>
-    </section>
-    <div class="actions">
-      <button id="retry-button" class="action-button" type="button">{retry}</button>
-      <button id="gui-log-button" class="action-button" type="button">{download_gui_log}</button>
-      <button id="launcher-log-button" class="action-button" type="button">{download_launcher_log}</button>
-      <span id="retry-status" class="status"></span>
+      <div class="footer">AzurPilot · {connection_info}</div>
     </div>
   </main>
   <script>
@@ -2577,7 +3197,7 @@ fn backend_error_html(port: u16, error_detail: &str) -> String {
     )
 }
 
-fn splash_redesigned_shell_html(light_bg_b64: &str, dark_bg_b64: &str) -> String {
+fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> String {
     let i18n = serde_json::json!({
         "defaultTip": t!("tips.17"),
         "loading": t!("splash.loading_badge"),
@@ -2598,6 +3218,13 @@ fn splash_redesigned_shell_html(light_bg_b64: &str, dark_bg_b64: &str) -> String
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
+  @font-face {
+    font-family: "MiSans";
+    src: url(data:font/ttf;base64,$MI_SANS_FONT) format("truetype");
+    font-weight: 100 900;
+    font-style: normal;
+    font-display: swap;
+  }
   :root {
     --primary-color: #4facfe;
     --secondary-color: #00f2fe;
@@ -2623,7 +3250,9 @@ fn splash_redesigned_shell_html(light_bg_b64: &str, dark_bg_b64: &str) -> String
     background: #111827;
   }
   body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Microsoft YaHei", sans-serif;
+    font-family: "MiSans", sans-serif;
+    font-weight: 420;
+    font-synthesis: none;
     color: var(--text-main);
   }
   button {
@@ -2635,25 +3264,29 @@ fn splash_redesigned_shell_html(light_bg_b64: &str, dark_bg_b64: &str) -> String
     height: 100%;
     overflow: hidden;
     border-radius: 0;
-    background: url(data:image/webp;base64,$LIGHT_BG) center/cover no-repeat;
+    background: #111827;
     box-shadow: none;
     display: flex;
     flex-direction: column;
     justify-content: space-between;
   }
-  @media (prefers-color-scheme: dark) {
-    .launcher-window {
-      background-image: url(data:image/webp;base64,$DARK_BG);
-    }
+  .splash-background-video {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    pointer-events: none;
   }
   .launcher-window::before {
     content: "";
     position: absolute;
     inset: 0;
-    z-index: 0;
+    z-index: 1;
     background:
-      linear-gradient(to bottom, rgba(0, 0, 0, 0.16) 0%, rgba(0, 0, 0, 0.08) 42%, rgba(0, 0, 0, 0.58) 100%),
-      linear-gradient(115deg, rgba(12, 30, 72, 0.22), rgba(255, 126, 117, 0.12));
+      linear-gradient(to bottom, rgba(0, 0, 0, 0.05) 0%, rgba(0, 0, 0, 0.03) 42%, rgba(0, 0, 0, 0.28) 100%),
+      linear-gradient(115deg, rgba(12, 30, 72, 0.10), rgba(255, 126, 117, 0.05));
     pointer-events: none;
   }
   body.error-state .launcher-window::before {
@@ -2669,6 +3302,9 @@ fn splash_redesigned_shell_html(light_bg_b64: &str, dark_bg_b64: &str) -> String
     align-items: center;
     min-height: 60px;
     padding: 18px 24px;
+    touch-action: none;
+    app-region: drag;
+    -webkit-app-region: drag;
   }
   .brand-zone {
     display: flex;
@@ -2679,13 +3315,14 @@ fn splash_redesigned_shell_html(light_bg_b64: &str, dark_bg_b64: &str) -> String
   .app-title {
     color: var(--text-main);
     font-size: 18px;
-    font-weight: 700;
+    font-weight: 610;
     letter-spacing: 0;
     text-shadow: 0 2px 6px rgba(0, 0, 0, 0.22);
   }
   .app-version {
     color: var(--text-sub);
     font-size: 12px;
+    font-weight: 460;
     line-height: 1;
     background: rgba(255, 255, 255, 0.14);
     border: 1px solid rgba(255, 255, 255, 0.11);
@@ -2713,7 +3350,7 @@ fn splash_redesigned_shell_html(light_bg_b64: &str, dark_bg_b64: &str) -> String
     backdrop-filter: blur(12px);
     box-shadow: 0 10px 24px rgba(0, 0, 0, 0.12);
     font-size: 12px;
-    font-weight: 500;
+    font-weight: 460;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -2733,6 +3370,12 @@ fn splash_redesigned_shell_html(light_bg_b64: &str, dark_bg_b64: &str) -> String
     align-items: center;
     gap: 8px;
     flex: 0 0 auto;
+    app-region: no-drag;
+    -webkit-app-region: no-drag;
+  }
+  .window-controls * {
+    app-region: no-drag;
+    -webkit-app-region: no-drag;
   }
   .win-btn {
     width: 13px;
@@ -2816,14 +3459,14 @@ fn splash_redesigned_shell_html(light_bg_b64: &str, dark_bg_b64: &str) -> String
     color: var(--text-main);
     font-size: 24px;
     line-height: 1.2;
-    font-weight: 650;
+    font-weight: 620;
     letter-spacing: 0;
     text-shadow: 0 2px 10px rgba(0, 0, 0, 0.32);
   }
   .sub-action-text {
     color: var(--text-sub);
     font-size: 12px;
-    font-weight: 650;
+    font-weight: 480;
     letter-spacing: 1.2px;
     line-height: 1.45;
     margin: 0;
@@ -2831,7 +3474,6 @@ fn splash_redesigned_shell_html(light_bg_b64: &str, dark_bg_b64: &str) -> String
     max-height: 54px;
     overflow: hidden;
     text-shadow: 0 1px 5px rgba(0, 0, 0, 0.28);
-    text-transform: uppercase;
     white-space: pre-line;
   }
   .progress-container {
@@ -2877,9 +3519,60 @@ fn splash_redesigned_shell_html(light_bg_b64: &str, dark_bg_b64: &str) -> String
     top: -25px;
     color: var(--text-main);
     font-size: 14px;
-    font-weight: 750;
+    font-weight: 680;
     font-variant-numeric: tabular-nums;
     text-shadow: 0 2px 6px rgba(0, 0, 0, 0.32);
+  }
+  .uv-progress-container {
+    display: none;
+    margin-top: -3px;
+    margin-bottom: 15px;
+  }
+  .uv-progress-container.is-visible {
+    display: block;
+  }
+  .uv-progress-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 6px;
+    color: var(--text-sub);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+  }
+  .uv-progress-detail {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-align: right;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .uv-progress-bar-bg {
+    width: 100%;
+    height: 4px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.16);
+  }
+  .uv-progress-bar-fill {
+    position: relative;
+    width: 2%;
+    height: 100%;
+    overflow: hidden;
+    border-radius: inherit;
+    background: linear-gradient(90deg, #77e7a4, #47b8ff);
+    box-shadow: 0 0 10px rgba(71, 184, 255, 0.42);
+    transition: width 0.45s ease;
+  }
+  .uv-progress-bar-fill::after {
+    position: absolute;
+    inset: 0;
+    content: "";
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.42), transparent);
+    transform: translateX(-100%);
+    animation: sweep 1.8s ease-in-out infinite;
   }
   .footer-info {
     display: flex;
@@ -2900,6 +3593,7 @@ fn splash_redesigned_shell_html(light_bg_b64: &str, dark_bg_b64: &str) -> String
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    font-weight: 460;
     backdrop-filter: blur(7px);
   }
   .footer-right {
@@ -2912,6 +3606,7 @@ fn splash_redesigned_shell_html(light_bg_b64: &str, dark_bg_b64: &str) -> String
   .notice-text {
     color: var(--text-muted);
     white-space: nowrap;
+    font-weight: 450;
   }
   .splash-actions {
     display: none;
@@ -3008,6 +3703,9 @@ fn splash_redesigned_shell_html(light_bg_b64: &str, dark_bg_b64: &str) -> String
 </head>
 <body>
   <div class="launcher-window">
+    <video class="splash-background-video" autoplay muted loop playsinline preload="auto" aria-hidden="true">
+      <source src="data:video/mp4;base64,$VIDEO_BG" type="video/mp4">
+    </video>
     <div id="splash-drag-region" class="top-bar" data-tauri-drag-region>
       <div class="brand-zone">
         <span class="app-title">AzurPilot</span>
@@ -3045,6 +3743,16 @@ fn splash_redesigned_shell_html(light_bg_b64: &str, dark_bg_b64: &str) -> String
         </div>
       </div>
 
+      <div id="uv-progress-container" class="uv-progress-container" aria-hidden="true">
+        <div class="uv-progress-header">
+          <span id="uv-progress-detail" class="uv-progress-detail"></span>
+          <span id="uv-progress-pct">0%</span>
+        </div>
+        <div class="uv-progress-bar-bg">
+          <div id="uv-progress-fill" class="uv-progress-bar-fill" style="width: 2%;"></div>
+        </div>
+      </div>
+
       <div class="footer-info">
         <div id="tip-text" class="tip-text">Tips: $I18N_DEFAULT_TIP</div>
         <div class="footer-right">
@@ -3063,6 +3771,7 @@ fn splash_redesigned_shell_html(light_bg_b64: &str, dark_bg_b64: &str) -> String
     const invoke =
       (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke)
       || (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke);
+    const webviewDraggableRegionsEnabled = $NATIVE_TOUCH_DRAG;
 
     window.addEventListener('contextmenu', event => {
       event.preventDefault();
@@ -3095,6 +3804,10 @@ fn splash_redesigned_shell_html(light_bg_b64: &str, dark_bg_b64: &str) -> String
       const errorDot = document.getElementById('error-dot');
       const progressFill = document.getElementById('progress-fill');
       const progressPct = document.getElementById('progress-pct');
+      const uvProgressContainer = document.getElementById('uv-progress-container');
+      const uvProgressFill = document.getElementById('uv-progress-fill');
+      const uvProgressPct = document.getElementById('uv-progress-pct');
+      const uvProgressDetail = document.getElementById('uv-progress-detail');
       const progressMeta = document.getElementById('progress-meta');
       const splashActions = document.getElementById('splash-actions');
       const subtitle = splitSubtitle(payload.subtitle);
@@ -3110,6 +3823,19 @@ fn splash_redesigned_shell_html(light_bg_b64: &str, dark_bg_b64: &str) -> String
       const progress = Math.max(0, Math.min(100, Number(payload.progress || 0)));
       progressFill.style.width = progress + '%';
       progressPct.textContent = progress + '%';
+
+      const uvState = payload.uv_progress;
+      const hasUvProgress = !payload.is_error
+        && uvState
+        && Number.isFinite(Number(uvState.progress));
+      uvProgressContainer.classList.toggle('is-visible', Boolean(hasUvProgress));
+      uvProgressContainer.setAttribute('aria-hidden', String(!hasUvProgress));
+      if (hasUvProgress) {
+        const uvProgress = Math.max(0, Math.min(99, Number(uvState.progress)));
+        uvProgressFill.style.width = uvProgress + '%';
+        uvProgressPct.textContent = uvProgress + '%';
+        uvProgressDetail.textContent = String(uvState.detail || '');
+      }
 
       if (payload.is_error) {
         document.body.classList.add('error-state');
@@ -3168,10 +3894,11 @@ fn splash_redesigned_shell_html(light_bg_b64: &str, dark_bg_b64: &str) -> String
   </script>
 </body>
 </html>"#
-    .replace("$LIGHT_BG", light_bg_b64)
-    .replace("$DARK_BG", dark_bg_b64)
+    .replace("$VIDEO_BG", video_bg_b64)
+    .replace("$MI_SANS_FONT", mi_sans_font_b64)
     .replace("$LAUNCHER_VERSION", env!("CARGO_PKG_VERSION"))
     .replace("$I18N_JSON", &i18n_json)
+    .replace("$NATIVE_TOUCH_DRAG", if cfg!(windows) { "true" } else { "false" })
     .replace("$I18N_INITIALIZING", &escape_html(t!("splash.initializing")))
     .replace("$I18N_MINIMIZE", &escape_html(t!("titlebar.minimize")))
     .replace("$I18N_CLOSE", &escape_html(t!("titlebar.close")))
@@ -3360,7 +4087,7 @@ fn main_window_titlebar_injection_script() -> String {
             if (!document.getElementById('alas-launcher-titlebar-style')) {
                 const style = document.createElement('style');
                 style.id = 'alas-launcher-titlebar-style';
-                style.textContent = ':root{--alas-titlebar-height:44px}#alas-launcher-titlebar{position:fixed;top:0;left:0;right:0;height:var(--alas-titlebar-height);z-index:2147483647;user-select:none;background:transparent}#alas-launcher-titlebar *{box-sizing:border-box}.alas-titlebar-drag-zone{position:absolute;inset:0 120px 0 0;height:100%;background:transparent}.header-icon{display:flex;align-items:center;gap:8px;padding:0 12px;position:absolute;top:0;right:0;height:100%}.icon{width:12px;height:12px;border-radius:50%;border:none;cursor:pointer;flex:0 0 auto;position:relative;transition:filter 120ms ease;display:inline-flex;align-items:center;justify-content:center}.icon:active{filter:brightness(0.85)}.icon-hide{background:#3b82f6;box-shadow:0 0 0 .5px #2563eb}.icon-close{background:#ff5f57;box-shadow:0 0 0 .5px #e0443e}.icon-minimize{background:#febc2e;box-shadow:0 0 0 .5px #d4a017}.icon-maximize{background:#28c840;box-shadow:0 0 0 .5px #14ae35}.icon svg{width:7px;height:7px;stroke:rgba(0,0,0,.72);fill:none;stroke-width:1.35;stroke-linecap:round;stroke-linejoin:round;opacity:0;transition:opacity 150ms ease}.header-icon:hover .icon svg{opacity:1}@media(max-width:680px){.alas-titlebar-drag-zone{inset-right:88px}}';
+                style.textContent = ':root{--alas-titlebar-height:44px}#alas-launcher-titlebar{position:fixed;top:0;left:0;right:0;height:var(--alas-titlebar-height);z-index:2147483647;user-select:none;pointer-events:none;background:transparent}#alas-launcher-titlebar *{box-sizing:border-box}.alas-titlebar-drag-zone{position:absolute;inset:0 120px 0 0;height:100%;pointer-events:auto;background:transparent;touch-action:none;app-region:drag;-webkit-app-region:drag}.header-icon,.header-icon *{app-region:no-drag;-webkit-app-region:no-drag}.header-icon{display:flex;align-items:center;gap:8px;padding:0 12px;position:absolute;top:0;right:0;height:100%;pointer-events:auto}.icon{width:12px;height:12px;min-width:12px;min-height:12px;margin:0;padding:0;line-height:1;border-radius:50%;border:none;cursor:pointer;flex:0 0 auto;position:relative;transition:filter 120ms ease;display:inline-flex;align-items:center;justify-content:center}.icon:active{filter:brightness(0.85)}.icon-hide{background:#3b82f6;box-shadow:0 0 0 .5px #2563eb}.icon-close{background:#ff5f57;box-shadow:0 0 0 .5px #e0443e}.icon-minimize{background:#febc2e;box-shadow:0 0 0 .5px #d4a017}.icon-maximize{background:#28c840;box-shadow:0 0 0 .5px #14ae35}.icon svg{width:7px;height:7px;stroke:rgba(0,0,0,.72);fill:none;stroke-width:1.35;stroke-linecap:round;stroke-linejoin:round;opacity:0;transition:opacity 150ms ease}.header-icon:hover .icon svg{opacity:1}@media(max-width:680px){.alas-titlebar-drag-zone{inset-right:88px}}';
                 document.head.appendChild(style);
             }
             const titlebar = document.createElement('div');
@@ -3369,6 +4096,7 @@ fn main_window_titlebar_injection_script() -> String {
             document.body.dataset.alasCustomTitlebar = 'true';
             document.body.prepend(titlebar);
             const maximizeButton = titlebar.querySelector('[data-action="maximize"]');
+
             const syncMaximizeState = async () => {
                 if (!maximizeButton) return;
                 try {
@@ -3389,7 +4117,7 @@ fn main_window_titlebar_injection_script() -> String {
                         switch (button.dataset.action) {
                             case 'hide': await invoke('window_hide'); break;
                             case 'minimize': await invoke('window_minimize'); break;
-                            case 'maximize': await invoke('window_toggle_maximize'); break;
+                            case 'maximize': await invoke('window_toggle_maximize'); await syncMaximizeState(); break;
                             case 'close': await invoke('window_close'); break;
                         }
                     } catch (error) {
