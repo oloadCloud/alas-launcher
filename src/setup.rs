@@ -79,7 +79,7 @@ struct GitProgressState {
 const MAX_UPDATE_RETRIES: usize = 20;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 const CLEANUP_RETRIES: usize = 20;
-const PYTHON_VERSION: &str = "3.14.3";
+const PYTHON_VERSION: &str = "3.14.6";
 const DEFAULT_UV_PYTHON_INSTALL_MIRRORS: &[&str] = &[
     "https://registry.npmmirror.com/-/binary/python-build-standalone/",
     "https://mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone/",
