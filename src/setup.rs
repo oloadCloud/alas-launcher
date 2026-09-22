@@ -439,53 +439,33 @@ pub fn get_deploy_config() -> Option<JsonValue> {
     Some(config)
 }
 
-pub fn cleanup_runtime_for_rebuild() -> Result<()> {
+/// Remove the rebuildable runtime state so the next launch starts clean.
+///
+/// Only `.venv`, the repo's `cache/` and the uv cache go. The checkout, `config/` and `log/`
+/// stay, so a failed dependency sync never costs the user a fresh clone.
+pub fn reset_venv_for_rebuild() -> Result<()> {
     let repo_dir = alas_repo_dir();
-    let current_exe = std::env::current_exe()?;
-    let current_exe_name = current_exe
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("alas-launcher.exe")
-        .to_ascii_lowercase();
-    let repo_dir = repo_dir.canonicalize()?;
-    let exe_dir = current_exe
-        .parent()
-        .ok_or_else(|| anyhow!(t!("errors.launcher_dir_not_found")))?
-        .canonicalize()?;
-    if !cleanup_target_belongs_to_launcher(&repo_dir, &exe_dir) {
-        bail!(t!(
-            "errors.refuse_cleanup",
-            actual = repo_dir.display().to_string(),
-            expected = exe_dir.display().to_string()
-        ));
-    }
-
     kill_runtime_processes(&repo_dir);
+
+    remove_rebuildable_entry(&venv_dir())?;
+    remove_rebuildable_entry(&repo_dir.join("cache"))?;
     clean_uv_cache()?;
-
-    let mut failures = Vec::new();
-    for entry in fs::read_dir(&repo_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if should_keep_runtime_entry(&path, &current_exe_name) {
-            info!("Keeping {}", path.display());
-            continue;
-        }
-
-        info!("Removing {}", path.display());
-        if let Err(err) = remove_runtime_entry_with_retry(&path) {
-            failures.push(format!("{}: {err:#}", path.display()));
-        }
-    }
-
-    if !failures.is_empty() {
-        bail!(t!(
-            "errors.partial_cleanup_failed",
-            errors = failures.join("\n")
-        ));
-    }
-
     Ok(())
+}
+
+/// Delete a rebuildable path, treating an absent one as already clean.
+fn remove_rebuildable_entry(path: &Path) -> Result<()> {
+    if !path.exists() {
+        info!("No {} to remove", path.display());
+        return Ok(());
+    }
+    info!("Removing {}", path.display());
+    remove_runtime_entry_with_retry(path).with_context(|| {
+        t!(
+            "errors.reset_venv_failed",
+            error = path.display().to_string()
+        )
+    })
 }
 
 fn clean_uv_cache() -> Result<()> {
@@ -544,40 +524,6 @@ fn path_is_inside(path: &Path, parent: &Path) -> bool {
     path.canonicalize()
         .map(|path| path.starts_with(parent))
         .unwrap_or(false)
-}
-
-fn cleanup_target_belongs_to_launcher(repo_dir: &Path, exe_dir: &Path) -> bool {
-    if repo_dir == exe_dir {
-        return true;
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let Some(contents_dir) = exe_dir.parent() else {
-            return false;
-        };
-        let expected_repo_dir = contents_dir.join("AzurLaneAutoScript");
-        return exe_dir.file_name() == Some(std::ffi::OsStr::new("MacOS"))
-            && repo_dir == expected_repo_dir;
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        false
-    }
-}
-
-fn should_keep_runtime_entry(path: &Path, current_exe_name: &str) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return true;
-    };
-    let name = name.to_ascii_lowercase();
-    matches!(
-        name.as_str(),
-        "deploy" | "log" | "config" | "bootstrap" | "unins000.dat" | "unins000.exe"
-    ) || (cfg!(target_os = "macos") && name == ".venv")
-        || name == "alas-launcher.exe"
-        || name == current_exe_name
 }
 
 fn remove_runtime_entry(path: &Path) -> Result<()> {
@@ -1095,7 +1041,6 @@ fn uv_sync_project(
     bootstrap_uv: &Path,
     cancel_requested: &AtomicBool,
 ) -> Result<()> {
-    let bootstrap_uv = bootstrap_uv.to_path_buf();
     let indexes = ranked_pypi_indexes();
     let mut last_error = None;
 
@@ -1105,22 +1050,29 @@ fn uv_sync_project(
         }
 
         info!("Syncing dependencies with PyPI index: {index}");
-        remove_uv_lock_for_resolve()?;
-        let mut cmd = uv_sync_command(&bootstrap_uv, index);
         status_updater(dependency_start_update());
 
-        match run_command(
+        let mut cmd = uv_sync_command(bootstrap_uv, index);
+
+        let sync_result = run_command(
             &mut cmd,
             &mut status_updater,
             ScriptPhase::Dependencies,
             cancel_requested,
-        ) {
-            Ok(()) => return Ok(()),
+        );
+
+        match sync_result {
+            Ok(()) => {
+                info!("Dependency sync succeeded with PyPI index: {index}");
+                return Ok(());
+            }
             Err(err) => {
-                warn!("Dependency sync failed with PyPI index {index}: {err}");
+                warn!("Dependency sync failed with PyPI index {index}: {err:#}");
                 last_error = Some(err);
+
                 if attempt + 1 < indexes.len() {
-                    status_updater(pypi_index_fallback_update(&indexes[attempt + 1]));
+                    let next_index = &indexes[attempt + 1];
+                    status_updater(pypi_index_fallback_update(next_index));
                     thread::sleep(RETRY_DELAY);
                 }
             }
@@ -1154,17 +1106,6 @@ fn uv_sync_command_with_paths(
     uv_python_env_with_install_dir(&mut cmd, python_install_dir);
     ignore_uv_index_env(&mut cmd);
     cmd
-}
-
-fn remove_uv_lock_for_resolve() -> Result<()> {
-    let lock_path = Path::new("uv.lock");
-    if !lock_path.exists() {
-        return Ok(());
-    }
-    clear_readonly(lock_path)?;
-    fs::remove_file(lock_path).context("Failed to remove uv.lock before dependency resolution")?;
-    info!("Removed uv.lock so uv can regenerate dependency artifact URLs");
-    Ok(())
 }
 
 fn migrate_dependency_config() -> Result<()> {
@@ -1366,13 +1307,17 @@ fn push_unique_pypi_index(indexes: &mut Vec<String>, url: &str) {
     }
 }
 
+/// Candidate indexes in preference order.
+///
+/// A mirror configured in `deploy.yaml` leads, so the user's choice is what uv resolves against
+/// first; the built-in mirrors follow as the fallback chain.
 fn pypi_index_candidates() -> Vec<String> {
     let mut indexes = Vec::new();
-    for index in BUILTIN_PYPI_INDEXES {
-        push_unique_pypi_index(&mut indexes, index);
-    }
     if let Some(index) = deploy_pypi_mirror() {
         push_unique_pypi_index(&mut indexes, &index);
+    }
+    for index in BUILTIN_PYPI_INDEXES {
+        push_unique_pypi_index(&mut indexes, index);
     }
     push_unique_pypi_index(&mut indexes, DEFAULT_PYPI_INDEX);
     indexes
@@ -1433,6 +1378,7 @@ fn ranked_pypi_indexes() -> Vec<String> {
     };
 
     let fastest_index = indexes[fastest].clone();
+    let configured = deploy_pypi_mirror().and_then(|mirror| normalize_pypi_index(&mirror));
     let mut ranked: Vec<String> = Vec::with_capacity(indexes.len());
     for (order, _) in ranked_probe_orders {
         let index = &indexes[order];
@@ -1449,6 +1395,18 @@ fn ranked_pypi_indexes() -> Vec<String> {
             .any(|existing| pypi_indexes_match(existing, &index))
         {
             ranked.push(index);
+        }
+    }
+    if let Some(configured) = configured {
+        if let Some(position) = ranked
+            .iter()
+            .position(|existing| pypi_indexes_match(existing, &configured))
+        {
+            if position > 0 {
+                let configured = ranked.remove(position);
+                info!("Using the PyPI index configured in deploy.yaml: {configured}");
+                ranked.insert(0, configured);
+            }
         }
     }
     info!("Fastest PyPI index selected first: {fastest_index}");

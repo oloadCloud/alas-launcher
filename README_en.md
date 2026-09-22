@@ -34,6 +34,7 @@ Differences from Original Version
 3. Python package versions are locked by `pyproject.toml` and `uv.lock`. Automatic sync is enabled by default.
 4. Restarting and replacing adb is tricky, not implemented.
 5. Directory structure has been modified slightly.
+6. The Windows launcher detects system-wide Node.js and can download and install it after confirmation when it is missing.
 
 Technical Details
 ---

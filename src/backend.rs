@@ -12,6 +12,7 @@ use serde_json::Value as JsonValue;
 use tracing::{info, warn};
 
 use crate::setup::{isolate_python_child_environment, venv_python};
+use crate::{launcher_trust_secret, TRUST_SECRET_ENV};
 use crate::window_util::CreateNoWindow as _;
 
 const BACKEND_STARTUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -175,6 +176,9 @@ impl ManagedBackend {
 
         let mut command = Command::new(venv_python());
         command.args(config.args());
+        // 注入启动器信任密钥，WebUI 据此为启动器窗口开启免密；子进程缺省继承，
+        // isolate_python_child_environment 不清理该键。
+        command.env(TRUST_SECRET_ENV, launcher_trust_secret());
         isolate_python_child_environment(&mut command);
         let child = command.group().create_no_window().spawn()?;
         let mut res = Self { child: Some(child) };

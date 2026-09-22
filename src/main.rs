@@ -23,7 +23,7 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc, Arc, Mutex, OnceLock,
     },
     thread::{self},
     time::{Duration, Instant},
@@ -34,7 +34,7 @@ use crate::{
     launcher_control::start_launcher_control_stream,
     notify::{start_notify_stream, NotificationClickHandler},
     setup::{
-        cleanup_runtime_for_rebuild, get_deploy_config, rebuild_venv_and_sync_dependencies,
+        get_deploy_config, rebuild_venv_and_sync_dependencies, reset_venv_for_rebuild,
         setup_alas_repo, setup_environment, SplashUpdate,
     },
 };
@@ -59,10 +59,8 @@ use tauri::{
     webview::{PageLoadEvent, PageLoadPayload},
     Manager, Url, WebviewWindow,
 };
-use tauri_plugin_dialog::DialogExt;
-use tauri_plugin_dialog::FilePath;
+use tauri_plugin_dialog::{DialogExt, FilePath};
 use tauri_plugin_window_state::StateFlags;
-
 use tempfile::Builder as TempDirBuilder;
 use tracing::{debug, error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
@@ -123,6 +121,88 @@ const PREVIEW_CRASH_ARGS: &[&str] = &[
     "/preview-error",
 ];
 const START_MINIMIZED_ARGS: &[&str] = &["--start-minimized", "/start-minimized"];
+
+// ---------------------------------------------------------------------------
+// 启动器信任免密登录
+//
+// 启动器为每次会话生成一个随机信任密钥，经环境变量 TRUST_SECRET_ENV 注入到
+// gui.py 子进程。WebUI 启动后会据当前 --key / deploy.yaml Password 登记该
+// 密钥；启动器窗口导航前先向后端换发一次性令牌，再进入 /launcher-login 页面
+// 预置登录态实现免密。信任密钥与会话密钥解耦，其它浏览器仍走原密码门禁。
+// 手动 gui.py 启动时密钥未注入，WebUI 端整体关闭该通道。
+// ---------------------------------------------------------------------------
+pub(crate) const TRUST_SECRET_ENV: &str = "ALAS_WEBUI_TRUST_SECRET";
+const TRUST_SECRET_LENGTH: usize = 24;
+const TRUST_LOGIN_TIMEOUT: Duration = Duration::from_secs(3);
+
+static LAUNCHER_TRUST_SECRET: OnceLock<String> = OnceLock::new();
+
+/// 生成（首次）并返回本次会话的启动器信任密钥。
+pub(crate) fn launcher_trust_secret() -> &'static str {
+    LAUNCHER_TRUST_SECRET.get_or_init(|| {
+        use rand::RngCore;
+        let mut bytes = [0u8; TRUST_SECRET_LENGTH];
+        rand::rng().fill_bytes(&mut bytes);
+        BASE64_STANDARD.encode(bytes)
+    })
+}
+
+/// 计算主窗口应导航到的后端地址：若后端支持启动器免密（本机回环 + 密钥匹配），
+/// 则返回带一次性令牌的 /launcher-login 页面；否则回退普通后端首页，维持原有
+/// 登录行为。本函数不抛错，任何失败都静默回退。
+fn webui_navigate_url(port: u16) -> String {
+    let fallback = || backend_url(port);
+    let secret = launcher_trust_secret();
+    let client = match Client::builder()
+        .timeout(TRUST_LOGIN_TIMEOUT)
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return fallback(),
+    };
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/api/launcher/trusted-login"))
+        .header("X-Webui-Launcher-Secret", secret)
+        .send();
+    let response = match response {
+        Ok(response) if response.status().is_success() => response,
+        _ => return fallback(),
+    };
+    // reqwest 未启用 json feature，手动解析 body。
+    let body_text = match response.text() {
+        Ok(body_text) => body_text,
+        Err(_) => return fallback(),
+    };
+    let body: serde_json::Value = match serde_json::from_str(&body_text) {
+        Ok(body) => body,
+        Err(_) => return fallback(),
+    };
+    let Some(token) = body.get("token").and_then(|token| token.as_str()) else {
+        return fallback();
+    };
+    if token.is_empty() {
+        return fallback();
+    }
+    // 令牌为 URL-safe 随机串（secrets.token_urlsafe），可直接置于 query。
+    format!("http://127.0.0.1:{port}/launcher-login?token={token}")
+}
+
+/// URL 的日志安全形式：只保留 scheme/host/port/path，剔除 query，避免
+/// /launcher-login 的一次性令牌经日志落盘。
+fn redacted_url_log(url: &Url) -> String {
+    let Some(host) = url.host_str() else {
+        return url.to_string();
+    };
+    let mut out = format!("{}://{}", url.scheme(), host);
+    if let Some(port) = url.port() {
+        out.push(':');
+        out.push_str(&port.to_string());
+    }
+    out.push_str(url.path());
+    out
+}
+
+struct ExitControl(Arc<AtomicBool>);
 
 #[derive(Clone, Debug)]
 struct TimeBombConfig {
@@ -223,7 +303,7 @@ fn begin_startup_cleanup(
             warn!("Setup thread did not stop before startup cleanup timeout");
         }
 
-        match cleanup_runtime_for_rebuild() {
+        match reset_venv_for_rebuild() {
             Ok(()) => {
                 info!("Startup cleanup finished; runtime will be rebuilt on next launch");
             }
@@ -1432,9 +1512,15 @@ mod tests {
     fn test_splash_includes_optional_uv_progress() {
         let html = splash_redesigned_shell_html("video", "font");
 
+        assert!(html.contains("data:video/mp4;base64,video"));
         assert!(html.contains("id=\"uv-progress-container\""));
         assert!(html.contains("payload.uv_progress"));
         assert!(html.contains("id=\"uv-progress-detail\""));
+        assert!(html.contains("grid-template-columns: minmax(0, 1fr) auto"));
+        assert!(html.contains("background: rgba(250, 250, 247, 0.78)"));
+        assert!(html.contains("content: \"✦\""));
+        assert!(!html.contains("'Tips: ' + subtitle.tip"));
+        assert!(!html.contains("animation: sweep"));
     }
 
     #[test]
@@ -1478,7 +1564,19 @@ mod tests {
             assert!(titlebar_script.contains("-webkit-app-region:no-drag"));
             assert!(titlebar_script.contains("webviewDraggableRegionsEnabled"));
             assert!(titlebar_script.contains("if (webviewDraggableRegionsEnabled)"));
-            assert!(titlebar_script.contains("min-height:12px"));
+            assert!(titlebar_script.contains(
+                ".alas-titlebar-drag-zone{position:absolute;inset:0 148px 0 0;height:100%;pointer-events:none"
+            ));
+            assert!(titlebar_script.contains(".alas-titlebar-drag-segment{"));
+            assert!(titlebar_script.contains("const rebuildDragSegments = () =>"));
+            assert!(titlebar_script.contains("getComputedStyle(element).cursor !== 'pointer'"));
+            assert!(titlebar_script.contains("dragZone.replaceChildren(fragment)"));
+            assert!(titlebar_script.contains("min-height:28px"));
+            assert!(titlebar_script.contains("background:rgba(250,250,247,.78)"));
+            assert!(titlebar_script.contains(".icon-close{color:#e64f58}"));
+            assert!(titlebar_script.contains("--alas-titlebar-height:56px"));
+            assert!(titlebar_script.contains("transform:translateY(-6px) scale(.96)"));
+            assert!(!titlebar_script.contains("scale(.72)"));
             assert!(titlebar_script.contains("alas-close-menu"));
             assert!(!titlebar_script.contains("alas-close-optics"));
             assert!(!titlebar_script.contains("alas-island-open"));
@@ -2522,8 +2620,12 @@ async fn retry_backend_connection(
     window: WebviewWindow,
     port: u16,
 ) -> std::result::Result<bool, String> {
-    let connected = tauri::async_runtime::spawn_blocking(move || {
-        wait_for_backend_connection(port, BACKEND_NAVIGATION_TIMEOUT).is_ok()
+    // 等待与换发免密令牌均含阻塞调用，统一放在阻塞线程中执行。
+    let target_url = tauri::async_runtime::spawn_blocking(move || {
+        if wait_for_backend_connection(port, BACKEND_NAVIGATION_TIMEOUT).is_err() {
+            return None;
+        }
+        Some(webui_navigate_url(port))
     })
     .await
     .map_err(|e| {
@@ -2531,11 +2633,11 @@ async fn retry_backend_connection(
         e.to_string()
     })?;
 
-    if !connected {
+    let Some(target_url) = target_url else {
         return Ok(false);
-    }
+    };
 
-    let url = Url::parse(&backend_url(port)).map_err(|e| e.to_string())?;
+    let url = Url::parse(&target_url).map_err(|e| e.to_string())?;
     window.navigate(url).map_err(|e| {
         error!("Failed to navigate to reconnected backend: {e:?}");
         e.to_string()
@@ -2547,7 +2649,7 @@ fn page_load_injector(webview: WebviewWindow, payload: PageLoadPayload<'_>) {
     if payload.event() == PageLoadEvent::Finished {
         info!(
             "Injecting saveFile function to loaded page: {}",
-            payload.url()
+            redacted_url_log(payload.url())
         );
         let injected_js = r#"
 if (!window.alas_launcher_injected) {
@@ -2682,7 +2784,7 @@ fn wait_for_backend_connection(port: u16, timeout: Duration) -> Result<()> {
 fn navigate_backend_or_error(window: &WebviewWindow, port: u16) -> Result<bool> {
     match wait_for_backend_connection(port, BACKEND_NAVIGATION_TIMEOUT) {
         Ok(()) => {
-            let url = backend_url(port);
+            let url = webui_navigate_url(port);
             window.navigate(Url::parse(&url)?)?;
             Ok(true)
         }
@@ -2752,7 +2854,7 @@ fn handle_backend_navigation(app: tauri::AppHandle, port: u16, url: &Url) -> boo
     match check_backend_connection(port) {
         Ok(()) => true,
         Err(e) => {
-            let blocked_url = url.to_string();
+            let blocked_url = redacted_url_log(url);
             warn!(
                 "Blocked navigation to unreachable backend {}: {:?}",
                 blocked_url, e
@@ -3289,19 +3391,14 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
       linear-gradient(115deg, rgba(12, 30, 72, 0.10), rgba(255, 126, 117, 0.05));
     pointer-events: none;
   }
-  body.error-state .launcher-window::before {
-    background:
-      linear-gradient(to bottom, rgba(56, 0, 10, 0.28) 0%, rgba(78, 0, 13, 0.18) 42%, rgba(60, 0, 12, 0.68) 100%),
-      linear-gradient(115deg, rgba(255, 95, 87, 0.34), rgba(255, 189, 46, 0.08));
-  }
   .top-bar {
     position: relative;
     z-index: 2;
     display: flex;
     justify-content: space-between;
     align-items: center;
-    min-height: 60px;
-    padding: 18px 24px;
+    min-height: 56px;
+    padding: 10px 18px;
     touch-action: none;
     app-region: drag;
     -webkit-app-region: drag;
@@ -3333,28 +3430,27 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
   .top-right {
     display: flex;
     align-items: center;
-    gap: 18px;
+    gap: 8px;
     min-width: 0;
   }
   .status-badge {
     max-width: 260px;
-    min-height: 28px;
+    min-height: 32px;
     display: inline-flex;
     align-items: center;
     gap: 7px;
     border-radius: 999px;
-    padding: 6px 14px;
-    color: var(--text-main);
-    background: var(--surface-soft);
-    border: 1px solid var(--surface-border);
-    backdrop-filter: blur(12px);
-    box-shadow: 0 10px 24px rgba(0, 0, 0, 0.12);
+    padding: 6px 13px;
+    color: #394451;
+    background: rgba(250, 250, 247, 0.78);
+    border: 1px solid rgba(255, 255, 255, 0.92);
+    backdrop-filter: blur(16px) saturate(1.2);
+    box-shadow: 0 4px 14px rgba(61, 79, 97, 0.1), inset 0 1px 0 rgba(255, 255, 255, 0.36);
     font-size: 12px;
     font-weight: 460;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    animation: pulse 2.2s ease-in-out infinite;
   }
   .status-badge::before {
     content: "";
@@ -3368,7 +3464,14 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
   .window-controls {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 2px;
+    min-height: 36px;
+    padding: 3px 4px;
+    border: 1px solid rgba(255, 255, 255, 0.92);
+    border-radius: 18px;
+    background: rgba(250, 250, 247, 0.78);
+    box-shadow: 0 4px 14px rgba(61, 79, 97, 0.1), inset 0 1px 0 rgba(255, 255, 255, 0.36);
+    backdrop-filter: blur(16px) saturate(1.2);
     flex: 0 0 auto;
     app-region: no-drag;
     -webkit-app-region: no-drag;
@@ -3378,44 +3481,43 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
     -webkit-app-region: no-drag;
   }
   .win-btn {
-    width: 13px;
-    height: 13px;
+    width: 28px;
+    height: 28px;
     border: 0;
-    border-radius: 50%;
+    border-radius: 12px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     cursor: pointer;
     padding: 0;
-    transition: filter 140ms ease, transform 140ms ease;
+    color: #727b86;
+    background: transparent;
+    transition: transform 140ms cubic-bezier(.23, 1, .32, 1), background-color 140ms ease, color 140ms ease;
   }
   .win-btn:hover {
-    filter: brightness(1.07);
-    transform: scale(1.04);
+    color: #202832;
+    background: rgba(255, 255, 255, 0.72);
   }
   .win-btn:active {
-    filter: brightness(0.9);
-    transform: scale(0.97);
+    transform: scale(0.96);
   }
   .win-btn svg {
-    width: 7px;
-    height: 7px;
-    stroke: rgba(50, 42, 35, 0.72);
-    stroke-width: 1.45;
+    width: 11px;
+    height: 11px;
+    stroke: currentColor;
+    stroke-width: 1.35;
     stroke-linecap: round;
-    opacity: 0;
-    transition: opacity 140ms ease;
-  }
-  .window-controls:hover .win-btn svg {
     opacity: 1;
   }
   .win-btn.minimize {
-    background: var(--warning);
-    box-shadow: 0 0 0 0.5px rgba(156, 110, 6, 0.55);
+    color: #727b86;
   }
   .win-btn.close {
-    background: var(--danger);
-    box-shadow: 0 0 0 0.5px rgba(160, 32, 28, 0.55);
+    color: #e64f58;
+  }
+  .win-btn.close:hover {
+    color: #b5202e;
+    background: rgba(244, 91, 91, 0.15);
   }
   .main-content {
     position: relative;
@@ -3477,34 +3579,35 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
     white-space: pre-line;
   }
   .progress-container {
-    position: relative;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 12px;
     margin-bottom: 15px;
   }
   .progress-bar-bg {
+    grid-column: 1;
+    grid-row: 1;
     width: 100%;
-    height: 6px;
+    height: 5px;
     border-radius: 999px;
-    background: rgba(255, 255, 255, 0.22);
+    background: rgba(255, 255, 255, 0.2);
     overflow: hidden;
-    backdrop-filter: blur(5px);
+    box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.12);
+    backdrop-filter: blur(8px);
   }
   .progress-bar-fill {
     width: 4%;
     height: 100%;
     border-radius: inherit;
-    background: linear-gradient(90deg, var(--primary-color), var(--secondary-color));
-    box-shadow: 0 0 14px rgba(0, 242, 254, 0.5);
+    background: linear-gradient(90deg, #4facfe, #43d7f5);
+    box-shadow: 0 0 10px rgba(67, 215, 245, 0.38);
     position: relative;
     overflow: hidden;
-    transition: width 0.35s ease, background 0.2s ease;
+    transition: width 0.35s cubic-bezier(.23, 1, .32, 1), background-color 0.2s ease;
   }
   .progress-bar-fill::after {
-    content: "";
-    position: absolute;
-    inset: 0;
-    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.48), transparent);
-    transform: translateX(-100%);
-    animation: sweep 2s ease-in-out infinite;
+    display: none;
   }
   .progress-bar-fill-error {
     background: linear-gradient(90deg, #ff5f57, #ffbd2e);
@@ -3514,14 +3617,15 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
     display: none;
   }
   .progress-percentage {
-    position: absolute;
-    right: 0;
-    top: -25px;
+    grid-column: 2;
+    grid-row: 1;
+    min-width: 34px;
     color: var(--text-main);
-    font-size: 14px;
-    font-weight: 680;
+    font-size: 12px;
+    font-weight: 560;
+    text-align: right;
     font-variant-numeric: tabular-nums;
-    text-shadow: 0 2px 6px rgba(0, 0, 0, 0.32);
+    text-shadow: 0 1px 5px rgba(0, 0, 0, 0.28);
   }
   .uv-progress-container {
     display: none;
@@ -3554,7 +3658,7 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
     height: 4px;
     overflow: hidden;
     border-radius: 999px;
-    background: rgba(255, 255, 255, 0.16);
+    background: rgba(255, 255, 255, 0.14);
   }
   .uv-progress-bar-fill {
     position: relative;
@@ -3562,17 +3666,12 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
     height: 100%;
     overflow: hidden;
     border-radius: inherit;
-    background: linear-gradient(90deg, #77e7a4, #47b8ff);
-    box-shadow: 0 0 10px rgba(71, 184, 255, 0.42);
-    transition: width 0.45s ease;
+    background: #55cda0;
+    box-shadow: 0 0 8px rgba(85, 205, 160, 0.34);
+    transition: width 0.4s cubic-bezier(.23, 1, .32, 1);
   }
   .uv-progress-bar-fill::after {
-    position: absolute;
-    inset: 0;
-    content: "";
-    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.42), transparent);
-    transform: translateX(-100%);
-    animation: sweep 1.8s ease-in-out infinite;
+    display: none;
   }
   .footer-info {
     display: flex;
@@ -3583,18 +3682,29 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
     font-size: 12px;
   }
   .tip-text {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
     min-width: 0;
     max-width: 520px;
     color: var(--text-sub);
-    background: rgba(0, 0, 0, 0.16);
-    border-left: 3px solid var(--primary-color);
-    border-radius: 4px;
-    padding: 5px 12px;
+    background: rgba(15, 23, 42, 0.26);
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 12px;
+    padding: 7px 12px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     font-weight: 460;
-    backdrop-filter: blur(7px);
+    backdrop-filter: blur(12px) saturate(1.1);
+  }
+  .tip-text::before {
+    content: "✦";
+    color: var(--primary-color);
+    font-size: 12px;
+    line-height: 1;
+    text-shadow: 0 0 10px rgba(79, 172, 254, 0.55);
+    flex: 0 0 auto;
   }
   .footer-right {
     display: flex;
@@ -3615,19 +3725,24 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
     display: block;
   }
   .splash-log-button {
-    min-height: 28px;
-    border: 1px solid rgba(255, 255, 255, 0.28);
-    border-radius: 6px;
-    padding: 0 11px;
-    color: var(--text-main);
-    background: rgba(255, 255, 255, 0.14);
-    backdrop-filter: blur(10px);
+    min-height: 34px;
+    border: 1px solid rgba(255, 255, 255, 0.78);
+    border-radius: 12px;
+    padding: 0 14px;
+    color: #394451;
+    background: rgba(250, 250, 247, 0.78);
+    box-shadow: 0 4px 14px rgba(61, 79, 97, 0.1), inset 0 1px 0 rgba(255, 255, 255, 0.36);
+    backdrop-filter: blur(14px) saturate(1.15);
     cursor: pointer;
     font-size: 12px;
-    font-weight: 600;
+    font-weight: 560;
+    transition: transform 140ms cubic-bezier(.23, 1, .32, 1), background-color 140ms ease;
   }
   .splash-log-button:hover {
-    background: rgba(255, 255, 255, 0.23);
+    background: rgba(255, 255, 255, 0.9);
+  }
+  .splash-log-button:active {
+    transform: scale(0.97);
   }
   .splash-log-button:disabled {
     cursor: default;
@@ -3642,11 +3757,14 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
     box-shadow: 0 0 12px rgba(255, 95, 87, 0.76);
   }
   body.error-state .tip-text {
-    border-left-color: #ffbd2e;
+    border-color: rgba(255, 189, 46, 0.42);
+  }
+  body.error-state .tip-text::before {
+    color: #ffbd2e;
   }
   @media (max-width: 720px) {
     .top-bar {
-      padding: 16px 20px;
+      padding: 10px 16px;
     }
     .status-badge {
       max-width: 180px;
@@ -3691,13 +3809,6 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
   }
   @keyframes spin {
     to { transform: rotate(360deg); }
-  }
-  @keyframes pulse {
-    0%, 100% { opacity: 0.9; transform: scale(1); }
-    50% { opacity: 1; transform: scale(1.015); box-shadow: 0 0 18px rgba(255, 255, 255, 0.18); }
-  }
-  @keyframes sweep {
-    to { transform: translateX(200%); }
   }
 </style>
 </head>
@@ -3754,7 +3865,7 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
       </div>
 
       <div class="footer-info">
-        <div id="tip-text" class="tip-text">Tips: $I18N_DEFAULT_TIP</div>
+        <div id="tip-text" class="tip-text">$I18N_DEFAULT_TIP</div>
         <div class="footer-right">
           <div id="progress-meta" class="notice-text">$I18N_PROGRESS_META</div>
           <div id="splash-actions" class="splash-actions">
@@ -3813,7 +3924,7 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
       const subtitle = splitSubtitle(payload.subtitle);
 
       badgeText.textContent = payload.is_error ? i18n.errorBadge : subtitle.status;
-      document.getElementById('tip-text').textContent = 'Tips: ' + subtitle.tip;
+      document.getElementById('tip-text').textContent = subtitle.tip;
       document.getElementById('title').textContent = payload.title || i18n.starting;
       document.getElementById('detail').textContent = normalizeDetail(payload.detail);
       progressMeta.textContent = payload.is_error
@@ -4087,12 +4198,12 @@ fn main_window_titlebar_injection_script() -> String {
             if (!document.getElementById('alas-launcher-titlebar-style')) {
                 const style = document.createElement('style');
                 style.id = 'alas-launcher-titlebar-style';
-                style.textContent = ':root{--alas-titlebar-height:44px}#alas-launcher-titlebar{position:fixed;top:0;left:0;right:0;height:var(--alas-titlebar-height);z-index:2147483647;user-select:none;pointer-events:none;background:transparent}#alas-launcher-titlebar *{box-sizing:border-box}.alas-titlebar-drag-zone{position:absolute;inset:0 120px 0 0;height:100%;pointer-events:auto;background:transparent;touch-action:none;app-region:drag;-webkit-app-region:drag}.header-icon,.header-icon *{app-region:no-drag;-webkit-app-region:no-drag}.header-icon{display:flex;align-items:center;gap:8px;padding:0 12px;position:absolute;top:0;right:0;height:100%;pointer-events:auto}.icon{width:12px;height:12px;min-width:12px;min-height:12px;margin:0;padding:0;line-height:1;border-radius:50%;border:none;cursor:pointer;flex:0 0 auto;position:relative;transition:filter 120ms ease;display:inline-flex;align-items:center;justify-content:center}.icon:active{filter:brightness(0.85)}.icon-hide{background:#3b82f6;box-shadow:0 0 0 .5px #2563eb}.icon-close{background:#ff5f57;box-shadow:0 0 0 .5px #e0443e}.icon-minimize{background:#febc2e;box-shadow:0 0 0 .5px #d4a017}.icon-maximize{background:#28c840;box-shadow:0 0 0 .5px #14ae35}.icon svg{width:7px;height:7px;stroke:rgba(0,0,0,.72);fill:none;stroke-width:1.35;stroke-linecap:round;stroke-linejoin:round;opacity:0;transition:opacity 150ms ease}.header-icon:hover .icon svg{opacity:1}@media(max-width:680px){.alas-titlebar-drag-zone{inset-right:88px}}';
+                style.textContent = ':root{--alas-titlebar-height:37px}#alas-launcher-titlebar{position:fixed;top:0;left:0;right:0;height:var(--alas-titlebar-height);z-index:2147483647;user-select:none;pointer-events:none;background:transparent}#alas-launcher-titlebar *{box-sizing:border-box}.alas-titlebar-drag-segment{position:absolute;top:0;bottom:0;pointer-events:auto;background:transparent;touch-action:none;app-region:drag;-webkit-app-region:drag}.header-icon,.header-icon *{app-region:no-drag;-webkit-app-region:no-drag}.header-icon{display:flex;align-items:center;gap:0;position:absolute;top:0;right:0;height:37px;margin:0;padding:0;pointer-events:auto;background:transparent;border:none;box-shadow:none}.icon{width:36px;height:37px;margin:0;padding:0;border:none;background:transparent;cursor:pointer;flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;transition:color 140ms ease,filter 140ms ease,transform 100ms ease}.icon:active{transform:scale(.92)}.icon svg{width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:1.4;stroke-linecap:round;stroke-linejoin:round}.icon-hide{color:#a855f7}.icon-hide:hover{color:#7e22ce;filter:drop-shadow(0 0 5px #a855f7)}.icon-minimize{color:#0284c7}.icon-minimize:hover{color:#0369a1;filter:drop-shadow(0 0 5px #0284c7)}.icon-maximize{color:#10b981}.icon-maximize:hover{color:#047857;filter:drop-shadow(0 0 5px #10b981)}.icon-close{color:#ef4444}.icon-close:hover{color:#b91c1c;filter:drop-shadow(0 0 5px #ef4444)}';
                 document.head.appendChild(style);
             }
             const titlebar = document.createElement('div');
             titlebar.id = 'alas-launcher-titlebar';
-            titlebar.innerHTML = '<div class="alas-titlebar-drag-zone" data-tauri-drag-region aria-hidden="true"></div><div class="header-icon"><button type="button" class="icon icon-hide" data-action="hide" aria-label="'+i18n.hideLabel+'" title="'+i18n.hideLabel+'"><svg viewBox="0 0 6 6"><rect x="1" y="1" width="4" height="4" rx="1"/><path d="M2 3h2"/></svg></button><button type="button" class="icon icon-minimize" data-action="minimize" aria-label="'+i18n.minimizeLabel+'" title="'+i18n.minimizeTitle+'"><svg viewBox="0 0 6 6"><line x1="1" y1="3" x2="5" y2="3"/></svg></button><button type="button" class="icon icon-maximize" data-action="maximize" aria-label="'+i18n.maximizeLabel+'" title="'+i18n.maximizeTitle+'"><svg viewBox="0 0 6 6" class="svg-restore" style="display:none"><polyline points="1,3 1,1 3,1"/><polyline points="3,5 5,5 5,3"/></svg><svg viewBox="0 0 6 6" class="svg-maximize"><polyline points="1,2.5 1,1 2.5,1"/><polyline points="3.5,5 5,5 5,3.5"/></svg></button><button type="button" class="icon icon-close" data-action="close" aria-label="'+i18n.closeLabel+'" title="'+i18n.closeTitle+'"><svg viewBox="0 0 6 6"><line x1="1" y1="1" x2="5" y2="5"/><line x1="5" y1="1" x2="1" y2="5"/></svg></button></div>';
+            titlebar.innerHTML = '<div class="alas-titlebar-drag-segment" data-tauri-drag-region style="left:110px;width:50px"></div><div class="alas-titlebar-drag-segment" data-tauri-drag-region style="left:380px;right:144px"></div><div class="header-icon"><button type="button" class="icon icon-hide" data-action="hide" aria-label="'+i18n.hideLabel+'" title="'+i18n.hideLabel+'"><svg viewBox="0 0 10 10"><line x1="2.5" y1="2.5" x2="7.5" y2="7.5"/><polyline points="4,7.5 7.5,7.5 7.5,4"/></svg></button><button type="button" class="icon icon-minimize" data-action="minimize" aria-label="'+i18n.minimizeLabel+'" title="'+i18n.minimizeTitle+'"><svg viewBox="0 0 10 10"><line x1="1.5" y1="5" x2="8.5" y2="5"/></svg></button><button type="button" class="icon icon-maximize" data-action="maximize" aria-label="'+i18n.maximizeLabel+'" title="'+i18n.maximizeTitle+'"><svg viewBox="0 0 10 10" class="svg-restore" style="display:none"><path d="M3.5 1.5h5v5"/><rect x="1.5" y="3.5" width="5" height="5"/></svg><svg viewBox="0 0 10 10" class="svg-maximize"><rect x="1.5" y="1.5" width="7" height="7"/></svg></button><button type="button" class="icon icon-close" data-action="close" aria-label="'+i18n.closeLabel+'" title="'+i18n.closeTitle+'"><svg viewBox="0 0 10 10"><line x1="2" y1="2" x2="8" y2="8"/><line x1="8" y1="2" x2="2" y2="8"/></svg></button></div>';
             document.body.dataset.alasCustomTitlebar = 'true';
             document.body.prepend(titlebar);
             const maximizeButton = titlebar.querySelector('[data-action="maximize"]');

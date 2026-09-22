@@ -35,6 +35,7 @@ AzurPilot: 一种新型的 [AzurLaneAutoScript](https://github.com/LmeSzinc/Azur
 3. Python 包版本由 `pyproject.toml` 和 `uv.lock` 锁定，自动同步默认已启用。
 4. 重启和替换adb不好搞，没做。
 5. 目录结构变动了一下。
+6. Windows 版启动器会检测系统级 Node.js；未检测到时可在确认后自动下载并安装。
 
 具体折腾了些啥？
 ---
