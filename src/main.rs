@@ -1491,6 +1491,18 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn backend_unready_error_carries_the_reason_from_the_log() {
+        let with_reason = backend_unready_error(
+            anyhow!("connect failed"),
+            Some("React 前端构建失败".to_owned()),
+        );
+        assert!(format!("{with_reason:#}").contains("React 前端构建失败"));
+
+        let without_reason = backend_unready_error(anyhow!("connect failed"), None);
+        assert_eq!(format!("{without_reason:#}"), "connect failed");
+    }
+
     fn test_english_splash_i18n_uses_json_literals() {
         rust_i18n::set_locale("en");
 
@@ -1949,7 +1961,7 @@ fn prompt_for_missing_nodejs(
         return true;
     }
 
-    match crate::nodejs::install_nodejs(cancel_requested, &mut status_updater) {
+    match crate::nodejs::install_nodejs(&availability, cancel_requested, &mut status_updater) {
         Ok(()) => {
             info!("Node.js installation completed successfully");
             true
@@ -2617,7 +2629,7 @@ fn save_as(app_handle: tauri::AppHandle, filename: &str, data: &str) {
                     let file_path = path
                         .as_ref()
                         .and_then(FilePath::as_path)
-                        .ok_or_else(|| anyhow!("Invalid file path {:?}", &path))?;
+                        .ok_or_else(|| anyhow!(t!("errors.invalid_file_path", path = format!("{:?}", &path))))?;
                     fs::write(file_path, &decoded_data)?;
                     info!("Saved file to {:?}", file_path);
                     Ok(())
@@ -2672,7 +2684,7 @@ fn download_log_file(
                 let file_path = path
                     .as_ref()
                     .and_then(FilePath::as_path)
-                    .ok_or_else(|| anyhow!("Invalid file path {:?}", &path))?;
+                    .ok_or_else(|| anyhow!(t!("errors.invalid_file_path", path = format!("{:?}", &path))))?;
                 fs::write(file_path, &data)?;
                 info!("Saved {} log to {:?}", log_name_for_save, file_path);
                 Ok(())
@@ -2883,7 +2895,25 @@ fn check_backend_connection(port: u16) -> Result<()> {
     let address: SocketAddr = format!("127.0.0.1:{port}").parse()?;
     TcpStream::connect_timeout(&address, BACKEND_CONNECT_TIMEOUT)
         .map(|_| ())
-        .map_err(|e| anyhow!("Unable to connect to local backend at {address}: {e}"))
+        .map_err(|e| {
+        anyhow!(t!(
+            "errors.backend_unreachable",
+            address = address.to_string(),
+            error = e.to_string()
+        ))
+    })
+}
+
+/// 未就绪提示与日志中的失败原因合成最终错误：日志里写了原因时一并带出。
+fn backend_unready_error(timeout_error: anyhow::Error, reason: Option<String>) -> anyhow::Error {
+    match reason {
+        Some(reason) => anyhow!(t!(
+            "errors.backend_unready_with_reason",
+            error = format!("{timeout_error:#}"),
+            reason = reason
+        )),
+        None => timeout_error,
+    }
 }
 
 fn wait_for_backend_connection(port: u16, timeout: Duration) -> Result<()> {
@@ -2899,7 +2929,11 @@ fn wait_for_backend_connection(port: u16, timeout: Duration) -> Result<()> {
         }
     }
 
-    Err(last_error.unwrap_or_else(|| anyhow!(t!("errors.backend_timeout"))))
+    let timeout_error = last_error.unwrap_or_else(|| anyhow!(t!("errors.backend_timeout")));
+    Err(backend_unready_error(
+        timeout_error,
+        crate::backend::read_backend_failure_reason(),
+    ))
 }
 
 fn navigate_backend_or_error(window: &WebviewWindow, port: u16) -> Result<bool> {
@@ -4165,7 +4199,7 @@ fn create_main_window(app: &tauri::AppHandle, port: u16) -> Result<WebviewWindow
         .windows
         .iter()
         .find(|w| w.label == "main")
-        .ok_or_else(|| anyhow!("Main window config not found"))?;
+        .ok_or_else(|| anyhow!(t!("errors.main_window_missing")))?;
 
     let app_for_navigation = app.clone();
     let main_window = tauri::WebviewWindowBuilder::from_config(app, main_config)?
@@ -4390,7 +4424,18 @@ fn main_window_titlebar_injection_script() -> String {
                 if (event.key === 'Escape' && closeMenu.classList.contains('is-open')) setCloseMenuOpen(false);
             });
             const interactiveSelector = 'a[href],button,input,select,textarea,summary,label[for],[role="button"],[role="link"],[contenteditable="true"],[tabindex]:not([tabindex="-1"]),[onclick]';
+            if (webviewDraggableRegionsEnabled) {
+                // Draggable regions swallow pointer events; no-drag holes keep the app controls clickable while the strip drags the window.
+                const noDragStyle = document.createElement('style');
+                noDragStyle.id = 'alas-launcher-no-drag-style';
+                noDragStyle.textContent = interactiveSelector + ',[data-alas-no-drag]{app-region:no-drag;-webkit-app-region:no-drag}'
+                    + '#alas-launcher-titlebar .alas-titlebar-drag-zone,#alas-launcher-titlebar .alas-titlebar-drag-segment{pointer-events:none;app-region:drag;-webkit-app-region:drag}'
+                    + '#alas-launcher-titlebar .alas-titlebar-drag-zone{user-select:none}';
+                document.head.appendChild(noDragStyle);
+            }
+            let lastDragSegmentKey = '';
             const rebuildDragSegments = () => {
+                if (webviewDraggableRegionsEnabled) return;
                 const dragRect = dragZone.getBoundingClientRect();
                 const dragWidth = Math.max(0, dragRect.width);
                 const exclusions = [];
@@ -4410,6 +4455,11 @@ fn main_window_titlebar_injection_script() -> String {
                     if (previous && interval[0] <= previous[1]) previous[1] = Math.max(previous[1], interval[1]);
                     else merged.push(interval);
                 });
+                // Segments are a pure function of the merged intervals and the available width;
+                // identical input means the DOM already matches, so skip the rewrite.
+                const dragSegmentKey = dragWidth + '|' + merged.map(interval => interval[0] + ':' + interval[1]).join(',');
+                if (dragSegmentKey === lastDragSegmentKey) return;
+                lastDragSegmentKey = dragSegmentKey;
                 const fragment = document.createDocumentFragment();
                 const appendSegment = (left, right) => {
                     if (right - left < 4) return;
@@ -4442,7 +4492,18 @@ fn main_window_titlebar_injection_script() -> String {
                 attributes: true,
                 attributeFilter: ['class', 'style', 'hidden', 'disabled', 'href', 'role', 'tabindex'],
             });
-            document.addEventListener('scroll', scheduleDragSegmentRebuild, { capture: true, passive: true });
+            // Only a scroll that moves content under the fixed titlebar can change the drag zones;
+            // a container lying entirely outside that band leaves the segments as they are.
+            const scrollAffectsTitlebar = event => {
+                const target = event.target;
+                if (!(target instanceof Element) || target === document.documentElement || target === document.body) return true;
+                const rect = target.getBoundingClientRect();
+                const band = dragZone.getBoundingClientRect();
+                return rect.bottom > band.top && rect.top < band.bottom && rect.right > band.left && rect.left < band.right;
+            };
+            document.addEventListener('scroll', event => {
+                if (scrollAffectsTitlebar(event)) scheduleDragSegmentRebuild();
+            }, { capture: true, passive: true });
             rebuildDragSegments();
             const syncMaximizeState = async () => {
                 if (!maximizeButton) return;

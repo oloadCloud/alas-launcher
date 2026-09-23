@@ -76,6 +76,25 @@ const NODEJS_LTS_X86_ZIP_URL: &str = "https://nodejs.org/dist/v22.22.2/node-v22.
 const NODEJS_LTS_X86_ZIP_SHA256: &str =
     "ca892f829a733109e341c43585fd2094177e9d2f2c45f97c7ed3cf329d5427c5";
 #[cfg(windows)]
+const NODEJS_LTS_X64_MSI_URL: &str = "https://nodejs.org/dist/v24.21.0/node-v24.21.0-x64.msi";
+#[cfg(windows)]
+const NODEJS_LTS_X64_MSI_SHA256: &str =
+    "bb0eaee134f9357f22aea915ee793343e627aefc1e66488164bac6915bce2cac";
+#[cfg(windows)]
+const NODEJS_LTS_ARM64_MSI_URL: &str = "https://nodejs.org/dist/v24.21.0/node-v24.21.0-arm64.msi";
+#[cfg(windows)]
+const NODEJS_LTS_ARM64_MSI_SHA256: &str =
+    "22ca85110f26015696a3fa9216bc372ae65203d170622eaf7d211e2dd5bb49e3";
+#[cfg(windows)]
+const NODEJS_LTS_X86_MSI_URL: &str = "https://nodejs.org/dist/v22.22.2/node-v22.22.2-x86.msi";
+#[cfg(windows)]
+const NODEJS_LTS_X86_MSI_SHA256: &str =
+    "e43cf42f461cbfea23a079925cfdd132a18cf66d4e30f64ec5ab4ec31dbb41f3";
+#[cfg(windows)]
+const NODEJS_MSI_FILE_NAME: &str = "nodejs-lts.msi";
+#[cfg(windows)]
+const NODEJS_INSTALLER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+#[cfg(windows)]
 const NODEJS_ARCHIVE_FILE_NAME: &str = "nodejs.zip";
 #[cfg(windows)]
 const NODEJS_DOWNLOAD_BUFFER_BYTES: usize = 64 * 1024;
@@ -100,6 +119,7 @@ const NODEJS_SECURE_INSTALLER_DIRECTORY_RANDOM_BYTES: usize = 16;
 struct NodeJsInstallation {
     executable: PathBuf,
     version: String,
+    parsed: (u32, u32, u32),
 }
 
 #[cfg(windows)]
@@ -135,7 +155,7 @@ impl SecureNodeJsInstallerDir {
             }
         }
 
-        bail!("Unable to allocate a protected Node.js installer directory")
+        bail!(t!("errors.nodejs_installer_dir"))
     }
 
     fn path(&self) -> &Path {
@@ -146,13 +166,7 @@ impl SecureNodeJsInstallerDir {
 #[cfg(windows)]
 impl Drop for SecureNodeJsInstallerDir {
     fn drop(&mut self) {
-        let installer = self.path.join(NODEJS_ARCHIVE_FILE_NAME);
-        if let Err(error) = fs::remove_file(&installer) {
-            if error.kind() != io::ErrorKind::NotFound {
-                warn!(path = %installer.display(), "Unable to remove Node.js installer: {error}");
-            }
-        }
-        if let Err(error) = fs::remove_dir(&self.path) {
+        if let Err(error) = fs::remove_dir_all(&self.path) {
             if error.kind() != io::ErrorKind::NotFound {
                 warn!(path = %self.path.display(), "Unable to remove Node.js installer directory: {error}");
             }
@@ -176,7 +190,7 @@ pub enum NodeJsAvailability {
 /// 启动器自有的 Node.js 安装目录，与系统安装完全隔离。
 fn private_nodejs_directory() -> Result<PathBuf> {
     let base = std::env::var_os("ProgramData")
-        .ok_or_else(|| anyhow::anyhow!("Unable to resolve ProgramData directory"))?;
+        .ok_or_else(|| anyhow::anyhow!(t!("errors.programdata_not_found")))?;
     Ok(PathBuf::from(base)
         .join(NODEJS_MACHINE_DIRECTORY)
         .join(NODEJS_PRIVATE_SUBDIRECTORY))
@@ -199,7 +213,7 @@ pub fn is_nodejs_available() -> NodeJsAvailability {
         let Some(installation) = probe_node(&executable) else {
             continue;
         };
-        if !meets_minimum_version(&installation.version) {
+        if !meets_minimum_version(installation.parsed) {
             warn!(
                 version = %installation.version,
                 executable = %installation.executable.display(),
@@ -233,13 +247,24 @@ pub fn is_nodejs_available() -> NodeJsAvailability {
 }
 
 #[cfg(windows)]
+/// 按可用性分派：达标不动，缺失装系统路径，版本过低装私有目录。
 pub fn install_nodejs(
+    availability: &NodeJsAvailability,
     cancel_requested: &AtomicBool,
     mut status_updater: impl FnMut(SplashUpdate),
 ) -> Result<()> {
-    if matches!(is_nodejs_available(), NodeJsAvailability::Ready) {
-        return Ok(());
+    match availability {
+        NodeJsAvailability::Ready => Ok(()),
+        NodeJsAvailability::Missing => install_nodejs_system_wide(cancel_requested, &mut status_updater),
+        NodeJsAvailability::Outdated(_) => install_nodejs_portable(cancel_requested, &mut status_updater),
     }
+}
+
+#[cfg(windows)]
+fn install_nodejs_portable(
+    cancel_requested: &AtomicBool,
+    mut status_updater: impl FnMut(SplashUpdate),
+) -> Result<()> {
     if cancel_requested.load(Ordering::SeqCst) {
         bail!(t!("setup.cancel_cleaning"));
     }
@@ -270,7 +295,7 @@ pub fn install_nodejs(
     // 仅以私有目录的安装结果作为成功判据。
     let installed = target.join("node.exe");
     if probe_node(&installed)
-        .is_some_and(|installation| meets_minimum_version(&installation.version))
+        .is_some_and(|installation| meets_minimum_version(installation.parsed))
     {
         return Ok(());
     }
@@ -280,6 +305,130 @@ pub fn install_nodejs(
         installed.display()
     );
 }
+#[cfg(windows)]
+fn nodejs_msi_installer_for_current_architecture() -> Result<NodeJsInstaller> {
+    nodejs_msi_installer_for_architecture(env::consts::ARCH)
+}
+
+#[cfg(windows)]
+fn nodejs_msi_installer_for_architecture(architecture: &str) -> Result<NodeJsInstaller> {
+    match architecture {
+        "x86_64" => Ok(NodeJsInstaller {
+            version: NODEJS_LTS_VERSION,
+            url: NODEJS_LTS_X64_MSI_URL,
+            sha256: NODEJS_LTS_X64_MSI_SHA256,
+        }),
+        "aarch64" => Ok(NodeJsInstaller {
+            version: NODEJS_LTS_VERSION,
+            url: NODEJS_LTS_ARM64_MSI_URL,
+            sha256: NODEJS_LTS_ARM64_MSI_SHA256,
+        }),
+        "x86" => Ok(NodeJsInstaller {
+            version: NODEJS_LTS_X86_VERSION,
+            url: NODEJS_LTS_X86_MSI_URL,
+            sha256: NODEJS_LTS_X86_MSI_SHA256,
+        }),
+        other => bail!(
+            "Node.js automatic installation is not available for Windows architecture {other}"
+        ),
+    }
+}
+
+#[cfg(windows)]
+/// 系统路径下没有 Node.js 时安装官方 MSI 到系统路径。
+fn install_nodejs_system_wide(
+    cancel_requested: &AtomicBool,
+    status_updater: &mut impl FnMut(SplashUpdate),
+) -> Result<()> {
+    if cancel_requested.load(Ordering::SeqCst) {
+        bail!(t!("setup.cancel_cleaning"));
+    }
+
+    let installer = nodejs_msi_installer_for_current_architecture()?;
+    validate_nodejs_installer_source(installer.url, installer.sha256)?;
+    let installer_directory = SecureNodeJsInstallerDir::new()?;
+    let installer_path = installer_directory.path().join(NODEJS_MSI_FILE_NAME);
+
+    status_updater(SplashUpdate::loading(
+        t!("setup.installing_nodejs"),
+        t!("setup.downloading_nodejs", version = installer.version),
+        5,
+    ));
+    download_nodejs_installer(installer, &installer_path, cancel_requested)?;
+    verify_nodejs_installer(&installer_path, installer.sha256)?;
+
+    status_updater(SplashUpdate::loading(
+        t!("setup.installing_nodejs"),
+        t!("setup.installing_nodejs"),
+        7,
+    ));
+    run_nodejs_installer(&installer_path, cancel_requested, status_updater)?;
+
+    if matches!(is_nodejs_available(), NodeJsAvailability::Ready) {
+        return Ok(());
+    }
+
+    bail!(t!("errors.nodejs_exe_missing"))
+}
+
+#[cfg(windows)]
+fn nodejs_msi_args(installer_path: &Path) -> Vec<std::ffi::OsString> {
+    vec![
+        "/i".into(),
+        installer_path.as_os_str().to_owned(),
+        "/qn".into(),
+        "/norestart".into(),
+    ]
+}
+
+#[cfg(windows)]
+fn run_nodejs_installer(
+    installer_path: &Path,
+    cancel_requested: &AtomicBool,
+    status_updater: &mut impl FnMut(SplashUpdate),
+) -> Result<()> {
+    let mut command = Command::new(system_msiexec_path()?);
+    command.args(nodejs_msi_args(installer_path));
+    let mut child = command.create_no_window().spawn()?;
+    let mut wait_ticks = 0u16;
+
+    loop {
+        if cancel_requested.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(t!("setup.cancel_cleaning"));
+        }
+
+        if let Some(status) = child.try_wait()? {
+            if status.success() || status.code() == Some(3010) {
+                return Ok(());
+            }
+            bail!(t!("errors.nodejs_installer_exit", status = status.to_string()));
+        }
+
+        wait_ticks = wait_ticks.saturating_add(1);
+        if wait_ticks >= 10 {
+            wait_ticks = 0;
+            status_updater(SplashUpdate::loading(
+                t!("setup.installing_nodejs"),
+                t!("setup.installing_nodejs"),
+                7,
+            ));
+        }
+
+        std::thread::sleep(NODEJS_INSTALLER_POLL_INTERVAL);
+    }
+}
+
+#[cfg(windows)]
+fn system_msiexec_path() -> Result<PathBuf> {
+    // System directory resolved by the Win32 API, independent of PATH and the working directory.
+    let msiexec = system_directory()?.join("msiexec.exe");
+    if msiexec.is_file() {
+        return Ok(msiexec);
+    }
+    bail!(t!("errors.msiexec_not_found", path = msiexec.display().to_string()));
+}
 
 #[cfg(windows)]
 /// 取系统自带的 PowerShell；提权进程不从 PATH 解析可执行文件。
@@ -288,7 +437,7 @@ fn system_powershell_path() -> Result<PathBuf> {
     let length = loop {
         let length = unsafe { GetWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
         if length == 0 {
-            bail!("Unable to locate the Windows directory");
+            bail!(t!("errors.windows_dir_not_found"));
         }
         let length = length as usize;
         if length < buffer.len() {
@@ -305,7 +454,7 @@ fn system_powershell_path() -> Result<PathBuf> {
     if powershell.is_file() {
         return Ok(powershell);
     }
-    bail!("Windows PowerShell was not found at {}", powershell.display());
+    bail!(t!("errors.powershell_not_found", path = powershell.display().to_string()));
 }
 
 #[cfg(windows)]
@@ -326,6 +475,7 @@ fn probe_node(executable: &Path) -> Option<NodeJsInstallation> {
     Some(NodeJsInstallation {
         executable: executable.to_path_buf(),
         version: format!("{major}.{minor}.{patch}"),
+        parsed: (major, minor, patch),
     })
 }
 
@@ -406,9 +556,8 @@ fn parse_nodejs_version(output: &[u8]) -> Option<(u32, u32, u32)> {
 }
 
 /// 元组按位比较即字典序，与语义化版本一致。
-fn meets_minimum_version(version: &str) -> bool {
-    parse_nodejs_version(version.as_bytes())
-        .is_some_and(|parsed| parsed >= NODEJS_MIN_FRONTEND_VERSION)
+fn meets_minimum_version(parsed: (u32, u32, u32)) -> bool {
+    parsed >= NODEJS_MIN_FRONTEND_VERSION
 }
 
 fn format_version((major, minor, patch): (u32, u32, u32)) -> String {
@@ -447,10 +596,10 @@ fn nodejs_installer_for_architecture(architecture: &str) -> Result<NodeJsInstall
 #[cfg(windows)]
 fn validate_nodejs_installer_source(url: &str, digest: &str) -> Result<()> {
     if !url.starts_with("https://") {
-        bail!("Node.js installer URL must use HTTPS");
+        bail!(t!("errors.nodejs_url_not_https"));
     }
     if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("Node.js installer checksum is not a SHA-256 digest");
+        bail!(t!("errors.nodejs_digest_invalid"));
     }
     Ok(())
 }
@@ -573,14 +722,14 @@ fn extract_nodejs_zip(
 
     let status = run_status_command(&mut command, cancel_requested)?;
     if !status.success() {
-        bail!("Node.js extraction exited with {status}");
+        bail!(t!("errors.nodejs_extract_exit", status = status.to_string()));
     }
 
     flatten_single_child_directory(target)?;
 
     let installed = target.join("node.exe");
     if !installed.is_file() {
-        bail!("Node.js archive did not produce {}", installed.display());
+        bail!(t!("errors.nodejs_archive_incomplete", path = installed.display().to_string()));
     }
     Ok(())
 }
@@ -622,7 +771,7 @@ fn windows_temp_directory() -> Result<PathBuf> {
     let system_directory = system_directory()?;
     let windows_directory = system_directory
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("Unable to locate the Windows directory"))?;
+        .ok_or_else(|| anyhow::anyhow!(t!("errors.windows_dir_not_found")))?;
     let temp_directory = windows_directory.join("Temp");
     if temp_directory.is_dir() {
         return Ok(temp_directory);
@@ -639,7 +788,7 @@ fn system_directory() -> Result<PathBuf> {
     loop {
         let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
         if length == 0 {
-            bail!("Unable to locate the Windows system directory");
+            bail!(t!("errors.windows_system_dir_not_found"));
         }
         let length = length as usize;
         if length < buffer.len() {
@@ -709,6 +858,19 @@ fn secure_directory_suffix() -> String {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn secure_installer_dir_removes_downloaded_msi_on_drop() {
+        let directory = SecureNodeJsInstallerDir::new().expect("create secure installer directory");
+        let path = directory.path().to_path_buf();
+        fs::write(path.join(NODEJS_MSI_FILE_NAME), b"installer payload")
+            .expect("write installer payload");
+
+        drop(directory);
+
+        assert!(!path.exists(), "installer directory should be removed on drop");
+    }
+
     #[test]
     fn test_nodejs_installer_source_requires_https_and_sha256() {
         let digest = "a".repeat(64);
@@ -762,15 +924,15 @@ mod tests {
 
     #[test]
     fn test_minimum_version_accepts_only_versions_the_frontend_can_build_with() {
-        assert!(meets_minimum_version("22.12.0"));
-        assert!(meets_minimum_version("22.22.2"));
-        assert!(meets_minimum_version("24.21.0"));
+        assert!(meets_minimum_version((22, 12, 0)));
+        assert!(meets_minimum_version((22, 22, 2)));
+        assert!(meets_minimum_version((24, 21, 0)));
 
         // 低于 22.12.0 的旧版本必须被拒，否则前端构建会在用户机上失败。
-        assert!(!meets_minimum_version("22.11.0"));
-        assert!(!meets_minimum_version("20.19.0"));
-        assert!(!meets_minimum_version("18.20.4"));
-        assert!(!meets_minimum_version("16.20.2"));
+        assert!(!meets_minimum_version((22, 11, 0)));
+        assert!(!meets_minimum_version((20, 19, 0)));
+        assert!(!meets_minimum_version((18, 20, 4)));
+        assert!(!meets_minimum_version((16, 20, 2)));
     }
 
     #[test]

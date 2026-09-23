@@ -383,7 +383,7 @@ fn backend_exit_error(config: &WebuiLaunchConfig, status: &ExitStatus) -> anyhow
 }
 
 /// 读取当日 gui 日志尾部记录的失败原因。日志尚未写出时返回 None，由调用方退回通用提示。
-fn read_backend_failure_reason() -> Option<String> {
+pub(crate) fn read_backend_failure_reason() -> Option<String> {
     let log_directory = alas_repo_dir().join("log");
     let today = log_directory.join(format!("{}_gui.txt", Local::now().format("%Y-%m-%d")));
     let log_path = if today.is_file() {

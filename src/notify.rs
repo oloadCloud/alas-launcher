@@ -276,7 +276,7 @@ fn ensure_windows_app_user_model_id(id: &str, name: &str) -> Result<PathBuf> {
 #[cfg(windows)]
 fn ensure_windows_notification_icon() -> Result<PathBuf> {
     let data_dir = dirs::data_local_dir()
-        .ok_or_else(|| anyhow!("Unable to resolve local app data directory"))?
+        .ok_or_else(|| anyhow!(t!("errors.appdata_not_found")))?
         .join("AzurPilotLauncher");
     fs::create_dir_all(&data_dir)?;
 
