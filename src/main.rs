@@ -15,43 +15,31 @@ i18n!("locales", fallback = "en");
 
 use std::{
     cell::Cell,
-    collections::HashMap,
     fs,
-    io::{Read, Write},
     net::{SocketAddr, TcpStream},
-    path::{Path, PathBuf},
-    process::Command,
+    path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
     },
     thread::{self},
     time::{Duration, Instant},
 };
 
 use crate::{
-    backend::{is_backend_startup_timeout, ManagedBackend, WebuiLaunchConfig},
+    backend::{ManagedBackend, WebuiLaunchConfig},
     launcher_control::start_launcher_control_stream,
     notify::{start_notify_stream, NotificationClickHandler},
     setup::{
-        get_deploy_config, rebuild_venv_and_sync_dependencies, reset_venv_for_rebuild,
-        setup_alas_repo, setup_environment, SplashUpdate,
+        get_deploy_config, setup_alas_repo, setup_environment, SplashUpdate,
     },
 };
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use base64::{prelude::BASE64_STANDARD, Engine};
-use chrono::{DateTime, FixedOffset, Local, Utc};
-use reqwest::{
-    blocking::Client,
-    header::{
-        HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, CONTENT_RANGE, DATE, RANGE, USER_AGENT,
-    },
-    StatusCode,
-};
+use chrono::Local;
+use reqwest::blocking::Client;
 use rust_i18n::t;
-use serde::Deserialize;
 use serde_json::to_string;
-use sha2::{Digest, Sha256};
 use tauri::{
     image::Image,
     menu::{MenuBuilder, MenuItemBuilder},
@@ -61,6 +49,7 @@ use tauri::{
 };
 use tauri_plugin_dialog::{DialogExt, FilePath};
 use tauri_plugin_window_state::StateFlags;
+#[cfg(test)]
 use tempfile::Builder as TempDirBuilder;
 use tracing::{debug, error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
@@ -84,25 +73,8 @@ const BACKEND_ERROR_URL_BASE: &str = "alas-error://localhost/backend";
 const SPLASH_URL: &str = "http://alas-splash.localhost/";
 #[cfg(not(any(windows, target_os = "android")))]
 const SPLASH_URL: &str = "alas-splash://localhost/";
-const TIME_BOMB_CONFIG_SOURCE: &str = include_str!("../Cargo.toml");
 #[cfg(test)]
 const TAURI_CONFIG_SOURCE: &str = include_str!("../tauri.conf.json");
-const LAUNCHER_UPDATE_URL: &str = env!("LAUNCHER_UPDATE_URL");
-const LAUNCHER_UPDATE_FALLBACK_URL: &str =
-    "https://ap.launcher-update.nanoda.work/updata/stable.json";
-const LAUNCHER_UPDATE_SKIP_ENV: &str = "AZURPILOT_SKIP_LAUNCHER_UPDATE";
-const MINI_LAUNCHER_VERSION: &str = "0.0.1";
-const LAUNCHER_UPDATE_MTLS_IDENTITY: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/launcher_mtls_identity.pem"));
-const LAUNCHER_UPDATE_BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 AZURPILOT_LAUNCHER_UPDATE/2.0.4";
-const LAUNCHER_UPDATE_MAX_CONNECTIONS: usize = 8;
-const LAUNCHER_UPDATE_MIN_CHUNK_BYTES: u64 = 1024 * 1024;
-const LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START: u8 = 8;
-const LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_END: u8 = 88;
-#[cfg(windows)]
-const LAUNCHER_UPDATE_NO_CONSOLE_ENV: &str = "AZURPILOT_NO_ATTACH_CONSOLE";
-#[cfg(windows)]
-const LAUNCHER_UPDATE_APPLY_ARG: &str = "--apply-launcher-update";
 const PREVIEW_NO_UPDATE_ARGS: &[&str] = &[
     "--preview-no-update",
     "--skip-update",
@@ -155,6 +127,7 @@ fn webui_navigate_url(port: u16) -> String {
     let secret = launcher_trust_secret();
     let client = match Client::builder()
         .timeout(TRUST_LOGIN_TIMEOUT)
+        .no_proxy()
         .build()
     {
         Ok(client) => client,
@@ -202,33 +175,6 @@ fn redacted_url_log(url: &Url) -> String {
     out
 }
 
-struct ExitControl(Arc<AtomicBool>);
-
-#[derive(Clone, Debug)]
-struct TimeBombConfig {
-    expires_at: DateTime<FixedOffset>,
-    network_time_url: String,
-    message: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct LauncherUpdateManifest {
-    version: String,
-    platforms: HashMap<String, LauncherUpdatePlatform>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LauncherUpdatePlatform {
-    url: String,
-    sha256: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LauncherUpdateByteRange {
-    start: u64,
-    end: u64,
-}
-
 #[cfg(target_os = "macos")]
 fn tray_icon_for_platform() -> Image<'static> {
     info!("Loading macOS tray icon from embedded bytes...");
@@ -256,1007 +202,6 @@ fn tray_icon_for_platform() -> Image<'static> {
     })
 }
 
-fn begin_startup_cleanup(
-    app_handle: tauri::AppHandle,
-    allow_exit: Arc<AtomicBool>,
-    setup_cancel_requested: Arc<AtomicBool>,
-    setup_running: Arc<AtomicBool>,
-    startup_cleanup_started: Arc<AtomicBool>,
-) {
-	startup_cleanup_started.store(true, Ordering::SeqCst);
-	allow_exit.store(true, Ordering::SeqCst); let _ = (setup_cancel_requested, setup_running, startup_cleanup_started); app_handle.exit(0); return;
-	
-    if startup_cleanup_started
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return;
-    }
-
-    setup_cancel_requested.store(true, Ordering::SeqCst);
-    if let Some(splash) = app_handle.get_webview_window("splash") {
-        update_splash(
-            &splash,
-            &SplashUpdate::loading(
-                t!("dialog.cleaning_env"),
-                t!("dialog.cleaning_env_detail"),
-                99,
-            )
-            .with_subtitle(t!("dialog.cleaning_wait")),
-        );
-    }
-
-    app_handle
-        .dialog()
-        .message(t!("dialog.cleaning_message"))
-        .title(t!("dialog.cleaning_env"))
-        .show(|_| {});
-
-    thread::spawn(move || {
-        let started_at = Instant::now();
-        while setup_running.load(Ordering::SeqCst) && started_at.elapsed() < Duration::from_secs(30)
-        {
-            thread::sleep(Duration::from_millis(100));
-        }
-
-        if setup_running.load(Ordering::SeqCst) {
-            warn!("Setup thread did not stop before startup cleanup timeout");
-        }
-
-        match reset_venv_for_rebuild() {
-            Ok(()) => {
-                info!("Startup cleanup finished; runtime will be rebuilt on next launch");
-            }
-            Err(e) => {
-                error!("Startup cleanup failed: {:?}", e);
-                if let Some(splash) = app_handle.get_webview_window("splash") {
-                    update_splash(
-                        &splash,
-                        &SplashUpdate::error(
-                            t!("dialog.cleanup_failed"),
-                            t!("dialog.cleanup_failed_detail", error = format!("{e:#}")),
-                            99,
-                        ),
-                    );
-                }
-                startup_cleanup_started.store(false, Ordering::SeqCst);
-                return;
-            }
-        }
-
-        allow_exit.store(true, Ordering::SeqCst);
-        app_handle.exit(0);
-    });
-}
-
-fn time_bomb_config() -> Result<Option<TimeBombConfig>> {
-    let Some(section) = cargo_toml_section("package.metadata.alas-launcher.time-bomb") else {
-        return Ok(None);
-    };
-    let enabled = cargo_toml_value(section, "enabled")
-        .and_then(|value| value.parse::<bool>().ok())
-        .unwrap_or(false);
-    if !enabled {
-        return Ok(None);
-    }
-
-    let expires_at = cargo_toml_value(section, "expires-at")
-        .ok_or_else(|| anyhow!(t!("errors.time_bomb_not_configured")))?;
-    let expires_at = DateTime::parse_from_rfc3339(&expires_at)
-        .map_err(|err| anyhow!(t!("errors.time_bomb_format_error", error = err.to_string())))?;
-    let network_time_url = cargo_toml_value(section, "network-time-url")
-        .unwrap_or_else(|| "http://www.gstatic.com/generate_204".to_owned());
-    let message = cargo_toml_value(section, "message")
-        .unwrap_or_else(|| t!("errors.time_bomb_expired").to_string());
-
-    Ok(Some(TimeBombConfig {
-        expires_at,
-        network_time_url,
-        message,
-    }))
-}
-
-fn cargo_toml_section(section_name: &str) -> Option<&'static str> {
-    let header = format!("[{section_name}]");
-    let start = TIME_BOMB_CONFIG_SOURCE.find(&header)? + header.len();
-    let rest = &TIME_BOMB_CONFIG_SOURCE[start..];
-    let end = rest.find("\n[").unwrap_or(rest.len());
-    Some(&rest[..end])
-}
-
-fn cargo_toml_value(section: &str, key: &str) -> Option<String> {
-    for line in section.lines() {
-        let line = line
-            .split_once('#')
-            .map(|(left, _)| left)
-            .unwrap_or(line)
-            .trim();
-        let Some((left, right)) = line.split_once('=') else {
-            continue;
-        };
-        if left.trim() != key {
-            continue;
-        }
-        let value = right.trim();
-        return Some(
-            value
-                .strip_prefix('"')
-                .and_then(|value| value.strip_suffix('"'))
-                .unwrap_or(value)
-                .to_owned(),
-        );
-    }
-    None
-}
-
-fn time_bomb_expiration_message() -> Result<Option<String>> {
-    let Some(config) = time_bomb_config()? else {
-        return Ok(None);
-    };
-    let network_time = fetch_network_time(&config.network_time_url)?;
-    if network_time >= config.expires_at.with_timezone(&Utc) {
-        Ok(Some(config.message))
-    } else {
-        Ok(None)
-    }
-}
-
-fn fetch_network_time(url: &str) -> Result<DateTime<Utc>> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .no_proxy()
-        .build()?;
-    let response = client.get(url).send()?;
-    let date_header = response
-        .headers()
-        .get(DATE)
-        .ok_or_else(|| anyhow!(t!("errors.network_time_missing")))?
-        .to_str()?;
-    Ok(DateTime::parse_from_rfc2822(date_header)?.with_timezone(&Utc))
-}
-
-fn launcher_update_browser_headers() -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        USER_AGENT,
-        HeaderValue::from_static(LAUNCHER_UPDATE_BROWSER_UA),
-    );
-    headers.insert(
-        ACCEPT,
-        HeaderValue::from_static("application/octet-stream,application/json,text/plain,*/*;q=0.8"),
-    );
-    headers.insert(
-        ACCEPT_LANGUAGE,
-        HeaderValue::from_static("zh-CN,zh;q=0.9,en;q=0.8"),
-    );
-    headers
-}
-
-fn launcher_update_http_client(
-    timeout: Option<Duration>,
-    with_mtls_identity: bool,
-) -> Result<Client> {
-    let mut builder = Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .no_proxy()
-        .default_headers(launcher_update_browser_headers());
-    if with_mtls_identity && !LAUNCHER_UPDATE_MTLS_IDENTITY.is_empty() {
-        builder = builder.identity(reqwest::Identity::from_pem(LAUNCHER_UPDATE_MTLS_IDENTITY)?);
-    }
-    builder = match timeout {
-        Some(timeout) => builder.timeout(timeout),
-        None => builder.timeout(None),
-    };
-    Ok(builder.build()?)
-}
-
-fn fetch_launcher_update_manifest(client: &Client) -> Result<LauncherUpdateManifest> {
-    fetch_launcher_update_manifest_from_urls(
-        client,
-        &[LAUNCHER_UPDATE_URL, LAUNCHER_UPDATE_FALLBACK_URL],
-    )
-}
-
-fn fetch_launcher_update_manifest_from_urls(
-    client: &Client,
-    urls: &[&str],
-) -> Result<LauncherUpdateManifest> {
-    let mut failures = Vec::new();
-
-    for (index, url) in urls.iter().enumerate() {
-        if urls[..index].iter().any(|previous| previous == url) {
-            continue;
-        }
-
-        match fetch_launcher_update_manifest_from_url(client, url) {
-            Ok(manifest) => {
-                if index > 0 {
-                    info!("Using fallback launcher update manifest: {url}");
-                }
-                return Ok(manifest);
-            }
-            Err(error) => {
-                warn!("Unable to fetch launcher update manifest from {url}: {error:#}");
-                failures.push(format!("{url}: {error:#}"));
-            }
-        }
-    }
-
-    bail!(
-        "Unable to fetch launcher update manifest from all configured URLs: {}",
-        failures.join("; ")
-    )
-}
-
-fn fetch_launcher_update_manifest_from_url(
-    client: &Client,
-    url: &str,
-) -> Result<LauncherUpdateManifest> {
-    let manifest_text = client
-        .get(url)
-        .send()
-        .with_context(|| format!("request launcher update manifest from {url}"))?
-        .error_for_status()
-        .with_context(|| format!("validate launcher update manifest response from {url}"))?
-        .text()
-        .with_context(|| format!("read launcher update manifest from {url}"))?;
-    serde_json::from_str(&manifest_text)
-        .with_context(|| format!("parse launcher update manifest from {url}"))
-}
-
-fn launcher_version_is_mini(version: &str) -> bool {
-    version.strip_prefix('v').unwrap_or(version) == MINI_LAUNCHER_VERSION
-}
-
-fn check_launcher_update_and_restart(mut status_updater: impl FnMut(SplashUpdate)) -> Result<bool> {
-	return Ok(false);
-	
-    if std::env::var_os(LAUNCHER_UPDATE_SKIP_ENV).is_some() {
-        info!("Skipping launcher update check after restart");
-        std::env::remove_var(LAUNCHER_UPDATE_SKIP_ENV);
-        return Ok(false);
-    }
-
-    let current_version = env!("CARGO_PKG_VERSION");
-    let mini_launcher = launcher_version_is_mini(current_version);
-    let platform_key = launcher_update_platform_key();
-    let manifest_client = match launcher_update_http_client(Some(Duration::from_secs(10)), false) {
-        Ok(client) => client,
-        Err(err) => {
-            warn!("Unable to create launcher update client: {err:#}");
-            return Err(anyhow!(t!(
-                "launcher_update.check_failed",
-                error = format!("{err:#}")
-            )));
-        }
-    };
-    let manifest = match fetch_launcher_update_manifest(&manifest_client) {
-        Ok(manifest) => manifest,
-        Err(err) => {
-            return Err(anyhow!(t!(
-                "launcher_update.check_failed",
-                error = format!("{err:#}")
-            )));
-        }
-    };
-    let update_available = launcher_version_is_newer(current_version, &manifest.version)
-        .ok_or_else(|| {
-            warn!(
-                "Launcher update manifest contains an invalid version: {}",
-                manifest.version
-            );
-            anyhow!(t!(
-                "launcher_update.invalid_manifest_version",
-                version = manifest.version.clone()
-            ))
-        })?;
-    if !update_available {
-        info!(
-            "Launcher is up to date: current={}, latest={}",
-            current_version, manifest.version
-        );
-        if mini_launcher {
-            return Err(anyhow!(t!(
-                "launcher_update.mini_update_missing",
-                current = current_version,
-                latest = manifest.version
-            )));
-        }
-        return Ok(false);
-    }
-
-    let Some(platform) = manifest.platforms.get(platform_key) else {
-        warn!("No launcher update payload for platform {platform_key}");
-        return Err(anyhow!(t!(
-            "launcher_update.payload_missing",
-            platform = platform_key
-        )));
-    };
-
-    info!(
-        "Launcher update available: {} -> {}",
-        current_version, manifest.version
-    );
-    status_updater(
-        SplashUpdate::loading(
-            t!("launcher_update.updating"),
-            t!(
-                "launcher_update.available_detail",
-                version = manifest.version.clone()
-            ),
-            8,
-        )
-        .with_subtitle(t!("launcher_update.status")),
-    );
-
-    let current_exe = std::env::current_exe()?;
-    let update_path = launcher_update_temp_path(&current_exe);
-    if let Err(err) = download_launcher_update(
-        &platform.url,
-        &update_path,
-        &platform.sha256,
-        &mut status_updater,
-    ) {
-        warn!("Launcher update download failed: {err:#}");
-        return Err(err);
-    }
-    make_executable(&update_path)?;
-    status_updater(
-        SplashUpdate::loading(
-            t!("launcher_update.restart_title"),
-            t!("launcher_update.restarting_detail"),
-            100,
-        )
-        .with_subtitle(t!("launcher_update.restart_status")),
-    );
-    if let Err(err) = replace_launcher_and_restart(&current_exe, &update_path) {
-        warn!("Launcher update replacement failed: {err:#}");
-        return Err(err);
-    }
-    Ok(true)
-}
-
-fn download_launcher_update(
-    url: &str,
-    update_path: &Path,
-    expected_sha256: &str,
-    mut status_updater: impl FnMut(SplashUpdate),
-) -> Result<()> {
-    validate_launcher_update_payload(url, expected_sha256)?;
-
-    // The public manifest supplies the payload URL; ESA requires mTLS for the payload itself.
-    let client = launcher_update_http_client(None, true)?;
-    let part_path = launcher_update_part_path(update_path);
-    remove_launcher_update_file_if_exists(&part_path)?;
-    remove_launcher_update_file_if_exists(update_path)?;
-
-    info!("Downloading launcher update from {url}");
-    let range_total = launcher_update_range_total(&client, url)?;
-    let download_result = match range_total {
-        Some(total_bytes) => {
-            let ranges = launcher_update_byte_ranges(total_bytes);
-            if ranges.len() > 1 {
-                status_updater(
-                    SplashUpdate::loading(
-                        t!("launcher_update.updating"),
-                        t!(
-                            "launcher_update.parallel_downloading_detail",
-                            connections = ranges.len().to_string()
-                        ),
-                        LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START,
-                    )
-                    .with_subtitle(t!("launcher_update.status")),
-                );
-                download_launcher_update_parallel(
-                    &client,
-                    url,
-                    total_bytes,
-                    &ranges,
-                    &part_path,
-                    &mut status_updater,
-                )
-            } else {
-                info!("Launcher update payload is too small for parallel download");
-                download_launcher_update_sequential(
-                    &client,
-                    url,
-                    &part_path,
-                    Some(total_bytes),
-                    &mut status_updater,
-                )
-            }
-        }
-        None => {
-            info!("Launcher update server does not support HTTP byte ranges; using one connection");
-            download_launcher_update_sequential(&client, url, &part_path, None, &mut status_updater)
-        }
-    };
-    let _downloaded = match download_result {
-        Ok(downloaded) => downloaded,
-        Err(err) => {
-            cleanup_launcher_update_download_files(&part_path, update_path);
-            return Err(err);
-        }
-    };
-
-    status_updater(
-        SplashUpdate::loading(
-            t!("launcher_update.updating"),
-            t!("launcher_update.verifying_detail"),
-            92,
-        )
-        .with_subtitle(t!("launcher_update.status")),
-    );
-
-    let downloaded =
-        match verify_and_promote_launcher_update(&part_path, update_path, expected_sha256) {
-            Ok(downloaded) => downloaded,
-            Err(err) => {
-                cleanup_launcher_update_download_files(&part_path, update_path);
-                return Err(err);
-            }
-        };
-
-    info!(
-        "Launcher update downloaded: {} bytes -> {}",
-        downloaded,
-        update_path.display()
-    );
-    Ok(())
-}
-
-fn validate_launcher_update_payload(url: &str, expected_sha256: &str) -> Result<()> {
-    let parsed_url =
-        Url::parse(url).with_context(|| format!("invalid launcher update URL: {url}"))?;
-    if parsed_url.scheme() != "https" || parsed_url.host_str().is_none() {
-        bail!("launcher update URL must use HTTPS and include a host: {url}");
-    }
-    if !launcher_update_sha256_is_valid(expected_sha256) {
-        bail!("launcher update manifest contains an invalid SHA-256 digest");
-    }
-    Ok(())
-}
-
-fn launcher_update_sha256_is_valid(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn launcher_update_range_total(client: &Client, url: &str) -> Result<Option<u64>> {
-    let response = client
-        .get(url)
-        .header(RANGE, "bytes=0-0")
-        .send()?
-        .error_for_status()?;
-    if response.status() != StatusCode::PARTIAL_CONTENT {
-        return Ok(None);
-    }
-
-    let Some((start, end, total)) = response
-        .headers()
-        .get(CONTENT_RANGE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(parse_launcher_update_content_range)
-    else {
-        return Ok(None);
-    };
-    if start != 0 || end != 0 || total == 0 {
-        return Ok(None);
-    }
-    Ok(Some(total))
-}
-
-fn parse_launcher_update_content_range(value: &str) -> Option<(u64, u64, u64)> {
-    let value = value.trim().strip_prefix("bytes ")?;
-    let (range, total) = value.split_once('/')?;
-    let (start, end) = range.split_once('-')?;
-    let start = start.parse().ok()?;
-    let end = end.parse().ok()?;
-    let total = total.parse().ok()?;
-    (start <= end && end < total).then_some((start, end, total))
-}
-
-fn launcher_update_byte_ranges(total_bytes: u64) -> Vec<LauncherUpdateByteRange> {
-    if total_bytes == 0 {
-        return Vec::new();
-    }
-
-    let range_count = total_bytes
-        .saturating_add(LAUNCHER_UPDATE_MIN_CHUNK_BYTES - 1)
-        .checked_div(LAUNCHER_UPDATE_MIN_CHUNK_BYTES)
-        .unwrap_or(1)
-        .clamp(1, LAUNCHER_UPDATE_MAX_CONNECTIONS as u64) as usize;
-    let base_size = total_bytes / range_count as u64;
-    let extra_bytes = total_bytes % range_count as u64;
-    let mut start = 0;
-    let mut ranges = Vec::with_capacity(range_count);
-
-    for index in 0..range_count {
-        let size = base_size + u64::from(index < extra_bytes as usize);
-        let end = start + size - 1;
-        ranges.push(LauncherUpdateByteRange { start, end });
-        start = end + 1;
-    }
-    ranges
-}
-
-fn download_launcher_update_parallel(
-    client: &Client,
-    url: &str,
-    total_bytes: u64,
-    ranges: &[LauncherUpdateByteRange],
-    part_path: &Path,
-    status_updater: &mut impl FnMut(SplashUpdate),
-) -> Result<u64> {
-    let temp_dir = TempDirBuilder::new()
-        .prefix("azurpilot-launcher-update-")
-        .tempdir()
-        .context("create temporary launcher update download directory")?;
-    let (progress_sender, progress_receiver) = mpsc::channel();
-    let mut workers = Vec::with_capacity(ranges.len());
-    let mut chunk_paths = Vec::with_capacity(ranges.len());
-
-    for (index, range) in ranges.iter().copied().enumerate() {
-        let chunk_path = temp_dir.path().join(format!("chunk-{index:02}"));
-        let worker_client = client.clone();
-        let worker_url = url.to_owned();
-        let worker_path = chunk_path.clone();
-        let worker_sender = progress_sender.clone();
-        workers.push(thread::spawn(move || {
-            download_launcher_update_range(
-                &worker_client,
-                &worker_url,
-                range,
-                &worker_path,
-                &worker_sender,
-            )
-        }));
-        chunk_paths.push(chunk_path);
-    }
-    drop(progress_sender);
-
-    let started_at = Instant::now();
-    let mut downloaded_so_far = 0u64;
-    let mut last_reported_progress = LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START;
-    let mut last_reported_at = Instant::now() - Duration::from_secs(1);
-    while workers.iter().any(|worker| !worker.is_finished()) {
-        match progress_receiver.recv_timeout(Duration::from_millis(100)) {
-            Ok(downloaded) => {
-                downloaded_so_far = downloaded_so_far.saturating_add(downloaded);
-                report_launcher_update_download_progress(
-                    status_updater,
-                    downloaded_so_far,
-                    total_bytes,
-                    started_at,
-                    &mut last_reported_progress,
-                    &mut last_reported_at,
-                );
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    while let Ok(downloaded) = progress_receiver.try_recv() {
-        downloaded_so_far = downloaded_so_far.saturating_add(downloaded);
-    }
-
-    let mut completed_bytes = 0u64;
-    for worker in workers {
-        completed_bytes = completed_bytes.saturating_add(
-            worker
-                .join()
-                .map_err(|_| anyhow!("launcher update download worker panicked"))??,
-        );
-    }
-    if completed_bytes != total_bytes {
-        bail!(
-            "launcher update download incomplete: expected {} bytes, got {} bytes",
-            total_bytes,
-            completed_bytes
-        );
-    }
-
-    report_launcher_update_download_progress(
-        status_updater,
-        total_bytes,
-        total_bytes,
-        started_at,
-        &mut last_reported_progress,
-        &mut last_reported_at,
-    );
-    let merged_bytes = merge_launcher_update_chunks(&chunk_paths, part_path)?;
-    if merged_bytes != total_bytes {
-        bail!(
-            "launcher update merge incomplete: expected {} bytes, got {} bytes",
-            total_bytes,
-            merged_bytes
-        );
-    }
-    Ok(merged_bytes)
-}
-
-fn download_launcher_update_range(
-    client: &Client,
-    url: &str,
-    range: LauncherUpdateByteRange,
-    chunk_path: &Path,
-    progress_sender: &mpsc::Sender<u64>,
-) -> Result<u64> {
-    let requested_range = format!("bytes={}-{}", range.start, range.end);
-    let mut response = client
-        .get(url)
-        .header(RANGE, requested_range)
-        .send()?
-        .error_for_status()?;
-    if response.status() != StatusCode::PARTIAL_CONTENT {
-        bail!(
-            "launcher update server ignored byte range {}-{}",
-            range.start,
-            range.end
-        );
-    }
-
-    let Some((start, end, _)) = response
-        .headers()
-        .get(CONTENT_RANGE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(parse_launcher_update_content_range)
-    else {
-        bail!("launcher update range response is missing a valid Content-Range header");
-    };
-    if start != range.start || end != range.end {
-        bail!(
-            "launcher update range response does not match requested bytes {}-{}",
-            range.start,
-            range.end
-        );
-    }
-
-    let expected_bytes = range.end - range.start + 1;
-    if response
-        .content_length()
-        .is_some_and(|content_length| content_length != expected_bytes)
-    {
-        bail!(
-            "launcher update range response has wrong length for bytes {}-{}",
-            range.start,
-            range.end
-        );
-    }
-
-    let mut file = fs::File::create(chunk_path)?;
-    let mut downloaded = 0u64;
-    let mut buffer = [0u8; 128 * 1024];
-    loop {
-        let size = response.read(&mut buffer)?;
-        if size == 0 {
-            break;
-        }
-        file.write_all(&buffer[..size])?;
-        downloaded += size as u64;
-        let _ = progress_sender.send(size as u64);
-    }
-    file.flush()?;
-
-    if downloaded != expected_bytes {
-        bail!(
-            "launcher update range download incomplete for bytes {}-{}: expected {} bytes, got {} bytes",
-            range.start,
-            range.end,
-            expected_bytes,
-            downloaded
-        );
-    }
-    Ok(downloaded)
-}
-
-fn merge_launcher_update_chunks(chunk_paths: &[PathBuf], part_path: &Path) -> Result<u64> {
-    let mut output = fs::File::create(part_path).with_context(|| {
-        t!(
-            "errors.write_update_failed",
-            error = part_path.display().to_string()
-        )
-    })?;
-    let mut written = 0u64;
-    for chunk_path in chunk_paths {
-        let mut chunk = fs::File::open(chunk_path)?;
-        written = written.saturating_add(std::io::copy(&mut chunk, &mut output)?);
-    }
-    output.flush().with_context(|| {
-        t!(
-            "errors.write_update_failed",
-            error = part_path.display().to_string()
-        )
-    })?;
-    Ok(written)
-}
-
-fn report_launcher_update_download_progress(
-    status_updater: &mut impl FnMut(SplashUpdate),
-    downloaded: u64,
-    total_bytes: u64,
-    started_at: Instant,
-    last_reported_progress: &mut u8,
-    last_reported_at: &mut Instant,
-) {
-    let (progress, detail) =
-        launcher_download_progress_detail(downloaded, Some(total_bytes), started_at);
-    if progress > *last_reported_progress
-        || last_reported_at.elapsed() >= Duration::from_millis(250)
-    {
-        *last_reported_progress = progress;
-        *last_reported_at = Instant::now();
-        status_updater(
-            SplashUpdate::loading(t!("launcher_update.updating"), detail, progress)
-                .with_subtitle(t!("launcher_update.status")),
-        );
-    }
-}
-
-fn verify_and_promote_launcher_update(
-    part_path: &Path,
-    update_path: &Path,
-    expected_sha256: &str,
-) -> Result<u64> {
-    let digest_hex = sha256_file(part_path)?;
-    if !digest_hex.eq_ignore_ascii_case(expected_sha256) {
-        let _ = fs::remove_file(part_path);
-        bail!(
-            "launcher update sha256 mismatch: expected {}, got {}",
-            expected_sha256,
-            digest_hex
-        );
-    }
-
-    let downloaded = fs::metadata(part_path)?.len();
-    remove_launcher_update_file_if_exists(update_path)?;
-    fs::rename(part_path, update_path).with_context(|| {
-        format!(
-            "promote verified launcher update from {} to {}",
-            part_path.display(),
-            update_path.display()
-        )
-    })?;
-    Ok(downloaded)
-}
-
-fn launcher_update_part_path(update_path: &Path) -> PathBuf {
-    let Some(file_name) = update_path.file_name() else {
-        return update_path.with_extension("part");
-    };
-    let mut part_name = file_name.to_os_string();
-    part_name.push(".part");
-    update_path.with_file_name(part_name)
-}
-
-fn remove_launcher_update_file_if_exists(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn cleanup_launcher_update_download_files(part_path: &Path, update_path: &Path) {
-    for path in [part_path, update_path] {
-        if let Err(error) = remove_launcher_update_file_if_exists(path) {
-            warn!(
-                "Unable to clean launcher update download {}: {error}",
-                path.display()
-            );
-        }
-    }
-}
-
-fn download_launcher_update_sequential(
-    client: &Client,
-    url: &str,
-    update_path: &Path,
-    expected_total_bytes: Option<u64>,
-    mut status_updater: impl FnMut(SplashUpdate),
-) -> Result<u64> {
-    let mut response = client.get(url).send()?.error_for_status()?;
-    let total_bytes = expected_total_bytes.or_else(|| response.content_length());
-    let mut file = fs::File::create(update_path).with_context(|| {
-        t!(
-            "errors.write_update_failed",
-            error = update_path.display().to_string()
-        )
-    })?;
-    let mut downloaded = 0u64;
-    let mut buffer = [0u8; 128 * 1024];
-    let mut last_reported_progress = LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START;
-    let mut last_reported_at = Instant::now() - Duration::from_secs(1);
-    let download_started_at = Instant::now();
-
-    loop {
-        let size = response
-            .read(&mut buffer)
-            .with_context(|| t!("errors.download_update_failed", url = url))?;
-        if size == 0 {
-            break;
-        }
-        file.write_all(&buffer[..size]).with_context(|| {
-            t!(
-                "errors.write_update_failed",
-                error = update_path.display().to_string()
-            )
-        })?;
-        downloaded += size as u64;
-
-        let (progress, detail) =
-            launcher_download_progress_detail(downloaded, total_bytes, download_started_at);
-        if progress > last_reported_progress
-            || last_reported_at.elapsed() >= Duration::from_millis(250)
-        {
-            last_reported_progress = progress;
-            last_reported_at = Instant::now();
-            status_updater(
-                SplashUpdate::loading(t!("launcher_update.updating"), detail, progress)
-                    .with_subtitle(t!("launcher_update.status")),
-            );
-        }
-    }
-    file.flush().with_context(|| {
-        t!(
-            "errors.write_update_failed",
-            error = update_path.display().to_string()
-        )
-    })?;
-
-    if let Some(total_bytes) = total_bytes {
-        if downloaded != total_bytes {
-            return Err(anyhow!(
-                "launcher update download incomplete: expected {} bytes, got {} bytes",
-                total_bytes,
-                downloaded
-            ));
-        }
-    }
-
-    Ok(downloaded)
-}
-
-fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 128 * 1024];
-
-    loop {
-        let size = file.read(&mut buffer)?;
-        if size == 0 {
-            break;
-        }
-        hasher.update(&buffer[..size]);
-    }
-
-    let digest = hasher.finalize();
-    Ok(bytes_to_hex(&digest))
-}
-
-fn launcher_download_progress_detail(
-    downloaded: u64,
-    total_bytes: Option<u64>,
-    started_at: Instant,
-) -> (u8, String) {
-    let speed = format_speed(download_speed_bytes_per_second(downloaded, started_at));
-    if let Some(total) = total_bytes.filter(|total| *total > 0) {
-        let percentage = (downloaded.min(total).saturating_mul(100) / total) as u8;
-        let detail = t!(
-            "launcher_update.downloading_detail",
-            downloaded = format_bytes(downloaded),
-            total = format_bytes(total),
-            percent = percentage.to_string(),
-            speed = speed
-        )
-        .to_string();
-        let progress_span =
-            LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_END - LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START;
-        let progress = LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START
-            + ((u16::from(percentage) * u16::from(progress_span)) / 100) as u8;
-        return (progress, detail);
-    }
-
-    let mib_downloaded = downloaded / (1024 * 1024);
-    let progress = (LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START
-        + mib_downloaded.min(u64::from(
-            LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_END - LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START,
-        )) as u8)
-        .min(LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_END);
-    let detail = t!(
-        "launcher_update.downloading_detail_unknown",
-        downloaded = format_bytes(downloaded),
-        speed = speed
-    )
-    .to_string();
-    (progress, detail)
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    const GIB: f64 = MIB * 1024.0;
-
-    let bytes_f = bytes as f64;
-    if bytes_f >= GIB {
-        format!("{:.1} GiB", bytes_f / GIB)
-    } else if bytes_f >= MIB {
-        format!("{:.1} MiB", bytes_f / MIB)
-    } else if bytes_f >= KIB {
-        format!("{:.1} KiB", bytes_f / KIB)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
-fn download_speed_bytes_per_second(downloaded: u64, started_at: Instant) -> f64 {
-    let elapsed = started_at.elapsed().as_secs_f64().max(0.1);
-    downloaded as f64 / elapsed
-}
-
-fn format_speed(bytes_per_second: f64) -> String {
-    format_bytes(bytes_per_second.max(0.0).round() as u64)
-}
-
-fn launcher_update_platform_key() -> &'static str {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => "darwin-aarch64",
-        ("macos", "x86_64") => "darwin-x86_64",
-        ("linux", "x86_64") => "linux-x86_64",
-        ("linux", "aarch64") => "linux-aarch64",
-        ("windows", "x86_64") => "windows-x86_64",
-        ("windows", "x86") => "windows-i686",
-        ("windows", "aarch64") => "windows-aarch64",
-        _ => "unknown",
-    }
-}
-
-fn launcher_version_is_newer(current: &str, latest: &str) -> Option<bool> {
-    let current = parse_launcher_version(current)?;
-    let latest = parse_launcher_version(latest)?;
-    Some(latest > current)
-}
-
-fn parse_launcher_version(version: &str) -> Option<(u64, u64, u64, u64)> {
-    let version = version.strip_prefix('v').unwrap_or(version);
-    let version = match version.split_once('+') {
-        Some((version, build_metadata)) if valid_launcher_version_suffix(build_metadata) => version,
-        Some(_) => return None,
-        None => version,
-    };
-    let (core, suffix) = version.split_once('-').unwrap_or((version, ""));
-    if version.contains('-') && !valid_launcher_version_suffix(suffix) {
-        return None;
-    }
-    let mut nums = core.split('.');
-    let major = nums.next()?.parse::<u64>().ok()?;
-    let minor = nums.next()?.parse::<u64>().ok()?;
-    let patch = nums.next()?.parse::<u64>().ok()?;
-    if nums.next().is_some() {
-        return None;
-    }
-    let suffix_rank = suffix
-        .chars()
-        .rev()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>()
-        .parse::<u64>()
-        .unwrap_or(0);
-    Some((major, minor, patch, suffix_rank))
-}
-
-fn valid_launcher_version_suffix(value: &str) -> bool {
-    !value.is_empty()
-        && value.split('.').all(|identifier| {
-            !identifier.is_empty()
-                && identifier
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
-        })
-}
-
 fn launcher_arg_present(flags: &[&str]) -> bool {
     std::env::args().skip(1).any(|arg| {
         let arg = arg.to_ascii_lowercase();
@@ -1276,222 +221,9 @@ fn start_minimized_arg_present() -> bool {
     launcher_arg_present(START_MINIMIZED_ARGS)
 }
 
-fn launcher_update_temp_path(current_exe: &Path) -> PathBuf {
-    let file_name = current_exe
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("alas-launcher");
-    std::env::temp_dir().join(format!(
-        "azurpilot-launcher-update-{}-{file_name}",
-        std::process::id()
-    ))
-}
-
-fn bytes_to_hex(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(output, "{byte:02x}");
-    }
-    output
-}
-
-fn make_executable(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(path)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions)?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn replace_launcher_and_restart(current_exe: &Path, update_path: &Path) -> Result<()> {
-    fs::rename(update_path, current_exe).with_context(|| {
-        t!(
-            "errors.replace_launcher_failed",
-            error = current_exe.display().to_string()
-        )
-    })?;
-    Command::new(current_exe)
-        .env(LAUNCHER_UPDATE_SKIP_ENV, "1")
-        .spawn()
-        .with_context(|| {
-            t!(
-                "errors.restart_launcher_failed",
-                error = current_exe.display().to_string()
-            )
-        })?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn replace_launcher_and_restart(current_exe: &Path, update_path: &Path) -> Result<()> {
-    let helper_path = std::env::temp_dir().join(format!(
-        "azurpilot-launcher-update-helper-{}.exe",
-        std::process::id()
-    ));
-
-    fs::copy(current_exe, &helper_path).with_context(|| {
-        t!(
-            "errors.copy_file_failed",
-            src = current_exe.display().to_string(),
-            dest = helper_path.display().to_string()
-        )
-    })?;
-
-    use std::os::windows::process::CommandExt;
-    use winapi::um::winbase::CREATE_NO_WINDOW;
-    Command::new(&helper_path)
-        .arg(LAUNCHER_UPDATE_APPLY_ARG)
-        .arg(current_exe)
-        .arg(update_path)
-        .env(LAUNCHER_UPDATE_SKIP_ENV, "1")
-        .env(LAUNCHER_UPDATE_NO_CONSOLE_ENV, "1")
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .with_context(|| {
-            t!(
-                "errors.start_update_script_failed",
-                error = helper_path.display().to_string()
-            )
-        })?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn try_apply_launcher_update_from_args() -> Result<bool> {
-    use std::ffi::OsStr;
-
-    let mut args = std::env::args_os();
-    let _ = args.next();
-    let Some(mode) = args.next() else {
-        return Ok(false);
-    };
-    if mode != OsStr::new(LAUNCHER_UPDATE_APPLY_ARG) {
-        return Ok(false);
-    }
-
-    let target_path = args
-        .next()
-        .ok_or_else(|| anyhow!("missing launcher update target path"))?;
-    let update_path = args
-        .next()
-        .ok_or_else(|| anyhow!("missing launcher update payload path"))?;
-    apply_launcher_update_and_restart(PathBuf::from(target_path), PathBuf::from(update_path))?;
-    Ok(true)
-}
-
-#[cfg(windows)]
-fn apply_launcher_update_and_restart(target_path: PathBuf, update_path: PathBuf) -> Result<()> {
-    let mut last_error = None;
-    for _ in 0..60 {
-        match move_file_replace(&update_path, &target_path) {
-            Ok(()) => {
-                restart_launcher_after_update(&target_path)?;
-                schedule_file_delete_on_reboot(&std::env::current_exe()?);
-                return Ok(());
-            }
-            Err(err) => {
-                last_error = Some(err);
-                thread::sleep(Duration::from_secs(1));
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| anyhow!("launcher update replacement timed out")))
-}
-
-#[cfg(windows)]
-fn move_file_replace(from: &Path, to: &Path) -> Result<()> {
-    use winapi::um::winbase::{
-        MoveFileExW, MOVEFILE_COPY_ALLOWED, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let from_wide = path_to_wide(from);
-    let to_wide = path_to_wide(to);
-    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH;
-    let moved = unsafe { MoveFileExW(from_wide.as_ptr(), to_wide.as_ptr(), flags) };
-    if moved == 0 {
-        return Err(anyhow!(
-            "{}: {}",
-            t!(
-                "errors.replace_launcher_failed",
-                error = to.display().to_string()
-            ),
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn restart_launcher_after_update(target_path: &Path) -> Result<()> {
-    use std::os::windows::process::CommandExt;
-    use winapi::um::winbase::CREATE_NO_WINDOW;
-
-    Command::new(target_path)
-        .env(LAUNCHER_UPDATE_SKIP_ENV, "1")
-        .env(LAUNCHER_UPDATE_NO_CONSOLE_ENV, "1")
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .with_context(|| {
-            t!(
-                "errors.restart_launcher_failed",
-                error = target_path.display().to_string()
-            )
-        })?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn schedule_file_delete_on_reboot(path: &Path) {
-    use std::ptr;
-    use winapi::um::winbase::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
-
-    let path_wide = path_to_wide(path);
-    let _ = unsafe { MoveFileExW(path_wide.as_ptr(), ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT) };
-}
-
-#[cfg(windows)]
-fn path_to_wide(path: &Path) -> Vec<u16> {
-    use std::{iter, os::windows::ffi::OsStrExt};
-
-    path.as_os_str()
-        .encode_wide()
-        .chain(iter::once(0))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_time_bomb_config_parses_when_enabled() {
-        let section =
-            cargo_toml_section("package.metadata.alas-launcher.time-bomb").expect("section exists");
-        let enabled = cargo_toml_value(section, "enabled").as_deref() == Some("true");
-        let config = time_bomb_config().expect("time bomb config parses");
-        assert_eq!(config.is_some(), enabled);
-    }
-
-    #[test]
-    fn test_cargo_toml_value_reads_time_bomb_fields() {
-        let section =
-            cargo_toml_section("package.metadata.alas-launcher.time-bomb").expect("section exists");
-        assert!(cargo_toml_value(section, "expires-at").is_some());
-        assert_eq!(
-            Some("测试已结束，请安装正式版".to_owned()),
-            cargo_toml_value(section, "message")
-        );
-    }
 
     #[test]
     fn test_english_splash_i18n_uses_json_literals() {
@@ -1603,281 +335,6 @@ mod tests {
             assert!(args.contains("--no-proxy-server"));
         }
     }
-
-    #[test]
-    fn test_launcher_update_versions_must_be_valid() {
-        assert_eq!(launcher_version_is_newer("2.1.6", "2.1.7"), Some(true));
-        assert_eq!(
-            launcher_version_is_newer("2.1.6", "2.1.6+build.1"),
-            Some(false)
-        );
-        assert_eq!(launcher_version_is_newer("2.1.6", "not-a-version"), None);
-        assert_eq!(launcher_version_is_newer("2.1", "2.1.7"), None);
-        assert_eq!(launcher_version_is_newer("2.1.6", "2.1.7-"), None);
-    }
-
-    #[test]
-    fn test_launcher_update_manifest_uses_fallback_url() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
-        let address = listener.local_addr().expect("test server address");
-        let server = std::thread::spawn(move || {
-            let fallback_body = r#"{"version":"2.1.8","platforms":{}}"#;
-            let responses = [
-                (
-                    "/primary",
-                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        .to_owned(),
-                ),
-                (
-                    "/fallback",
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{fallback_body}",
-                        fallback_body.len()
-                    ),
-                ),
-            ];
-
-            for (expected_path, response) in responses {
-                let (mut stream, _) = listener.accept().expect("accept manifest request");
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .expect("set read timeout");
-                let mut request = Vec::new();
-                loop {
-                    let mut buffer = [0u8; 1024];
-                    let read = stream.read(&mut buffer).expect("read manifest request");
-                    assert!(read > 0, "manifest request ended before headers");
-                    request.extend_from_slice(&buffer[..read]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let request = String::from_utf8_lossy(&request);
-                assert!(request.starts_with(&format!("GET {expected_path} ")));
-                stream
-                    .write_all(response.as_bytes())
-                    .expect("write manifest response");
-            }
-        });
-
-        let client = Client::builder().no_proxy().build().expect("build client");
-        let primary = format!("http://{address}/primary");
-        let fallback = format!("http://{address}/fallback");
-        let manifest = fetch_launcher_update_manifest_from_urls(&client, &[&primary, &fallback])
-            .expect("fetch manifest from fallback");
-
-        assert_eq!(manifest.version, "2.1.8");
-        server.join().expect("manifest server completed");
-    }
-
-    #[test]
-    fn test_launcher_update_payload_requires_https_and_sha256() {
-        let digest = "a".repeat(64);
-
-        assert!(
-            validate_launcher_update_payload("https://updates.example/launcher", &digest).is_ok()
-        );
-        assert!(
-            validate_launcher_update_payload("http://updates.example/launcher", &digest).is_err()
-        );
-        assert!(validate_launcher_update_payload(
-            "https://updates.example/launcher",
-            "not-a-digest"
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn test_launcher_update_byte_ranges_cover_payload_once() {
-        let total_bytes = LAUNCHER_UPDATE_MIN_CHUNK_BYTES * 8 + 17;
-        let ranges = launcher_update_byte_ranges(total_bytes);
-
-        assert_eq!(ranges.len(), LAUNCHER_UPDATE_MAX_CONNECTIONS);
-        assert_eq!(ranges.first().map(|range| range.start), Some(0));
-        assert_eq!(ranges.last().map(|range| range.end), Some(total_bytes - 1));
-        assert_eq!(
-            ranges
-                .iter()
-                .map(|range| range.end - range.start + 1)
-                .sum::<u64>(),
-            total_bytes
-        );
-        assert!(ranges
-            .windows(2)
-            .all(|pair| pair[0].end + 1 == pair[1].start));
-    }
-
-    #[test]
-    fn test_launcher_update_content_range_parser() {
-        assert_eq!(
-            parse_launcher_update_content_range("bytes 10-19/42"),
-            Some((10, 19, 42))
-        );
-        assert_eq!(parse_launcher_update_content_range("bytes 0-0/*"), None);
-        assert_eq!(parse_launcher_update_content_range("bytes 19-10/42"), None);
-        assert_eq!(parse_launcher_update_content_range("not-a-range"), None);
-    }
-
-    #[test]
-    fn test_launcher_update_range_probe_falls_back_when_ignored() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
-        let address = listener.local_addr().expect("test server address");
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept range probe");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("set read timeout");
-            let mut request = Vec::new();
-            loop {
-                let mut buffer = [0u8; 1024];
-                let read = stream.read(&mut buffer).expect("read range probe");
-                assert!(read > 0, "range probe ended before headers");
-                request.extend_from_slice(&buffer[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            assert!(String::from_utf8_lossy(&request)
-                .lines()
-                .any(|line| line.eq_ignore_ascii_case("range: bytes=0-0")));
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .expect("write range probe response");
-        });
-
-        let client = Client::builder().no_proxy().build().expect("build client");
-        let url = format!("http://{address}/launcher");
-        assert_eq!(
-            launcher_update_range_total(&client, &url).expect("probe range support"),
-            None
-        );
-        server.join().expect("range probe server completed");
-    }
-
-    #[test]
-    fn test_parallel_launcher_update_download_merges_ranges() {
-        let payload: Vec<u8> = (0..(LAUNCHER_UPDATE_MIN_CHUNK_BYTES * 2 + 17))
-            .map(|index| (index % 251) as u8)
-            .collect();
-        let payload = Arc::new(payload);
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
-        let address = listener.local_addr().expect("test server address");
-        let request_count = launcher_update_byte_ranges(payload.len() as u64).len() + 1;
-        let server_payload = Arc::clone(&payload);
-        let server = std::thread::spawn(move || {
-            for _ in 0..request_count {
-                let (mut stream, _) = listener.accept().expect("accept range request");
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .expect("set read timeout");
-                let mut request = Vec::new();
-                loop {
-                    let mut buffer = [0u8; 1024];
-                    let read = stream.read(&mut buffer).expect("read range request");
-                    assert!(read > 0, "range request ended before headers");
-                    request.extend_from_slice(&buffer[..read]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-
-                let request = String::from_utf8_lossy(&request);
-                let range = request
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        if name.eq_ignore_ascii_case("range") {
-                            value.trim().strip_prefix("bytes=")
-                        } else {
-                            None
-                        }
-                    })
-                    .expect("range request header");
-                let (start, end) = range.split_once('-').expect("range bounds");
-                let start: usize = start.parse().expect("range start");
-                let end: usize = end.parse().expect("range end");
-                assert!(start <= end && end < server_payload.len());
-                let body = &server_payload[start..=end];
-                let response = format!(
-                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
-                    body.len(),
-                    start,
-                    end,
-                    server_payload.len()
-                );
-                stream
-                    .write_all(response.as_bytes())
-                    .expect("write headers");
-                stream.write_all(body).expect("write range body");
-            }
-        });
-
-        let client = Client::builder().no_proxy().build().expect("build client");
-        let url = format!("http://{address}/launcher");
-        let temp_dir = TempDirBuilder::new()
-            .prefix("launcher-range-test-")
-            .tempdir()
-            .unwrap();
-        let part_path = temp_dir.path().join("launcher.part");
-        let total_bytes = launcher_update_range_total(&client, &url)
-            .expect("probe range support")
-            .expect("server supports ranges");
-        let ranges = launcher_update_byte_ranges(total_bytes);
-        let mut progress = Vec::new();
-
-        let downloaded = download_launcher_update_parallel(
-            &client,
-            &url,
-            total_bytes,
-            &ranges,
-            &part_path,
-            &mut |update| progress.push(update.progress),
-        )
-        .expect("parallel launcher download");
-
-        assert_eq!(downloaded, payload.len() as u64);
-        let merged = fs::read(&part_path).expect("read merged file");
-        assert_eq!(merged.as_slice(), payload.as_slice());
-        assert!(progress
-            .iter()
-            .any(|value| *value > LAUNCHER_UPDATE_DOWNLOAD_PROGRESS_START));
-        server.join().expect("range server completed");
-    }
-
-    #[test]
-    fn test_launcher_update_promotion_requires_valid_digest() {
-        let temp_dir = TempDirBuilder::new()
-            .prefix("launcher-promotion-test-")
-            .tempdir()
-            .unwrap();
-        let part_path = temp_dir.path().join("launcher.part");
-        let update_path = temp_dir.path().join("launcher.update");
-        fs::write(&part_path, b"verified update").expect("write update part");
-        let digest = sha256_file(&part_path).expect("hash update part");
-
-        assert_eq!(
-            verify_and_promote_launcher_update(&part_path, &update_path, &digest)
-                .expect("promote verified update"),
-            b"verified update".len() as u64
-        );
-        assert!(!part_path.exists());
-        assert_eq!(
-            fs::read(&update_path).expect("read promoted update"),
-            b"verified update"
-        );
-
-        let failed_part_path = temp_dir.path().join("failed.part");
-        let failed_update_path = temp_dir.path().join("failed.update");
-        fs::write(&failed_part_path, b"unverified update").expect("write failed update part");
-        assert!(verify_and_promote_launcher_update(
-            &failed_part_path,
-            &failed_update_path,
-            &"0".repeat(64),
-        )
-        .is_err());
-        assert!(!failed_part_path.exists());
-        assert!(!failed_update_path.exists());
-    }
 }
 
 /// Set macOS activation policy to Regular (show in dock) or Accessory (hide from dock).
@@ -1895,20 +352,11 @@ fn set_macos_activation_policy(app: &tauri::AppHandle, regular: bool) {
 
 fn main() -> Result<()> {
     #[cfg(windows)]
-    if try_apply_launcher_update_from_args()? {
-        return Ok(());
-    }
-
-    #[cfg(windows)]
     unsafe {
         use crate::window_util::HAS_CONSOLE;
         use std::sync::atomic::Ordering;
         use winapi::um::wincon::{AttachConsole, ATTACH_PARENT_PROCESS};
-        if std::env::var_os(LAUNCHER_UPDATE_NO_CONSOLE_ENV).is_some() {
-            std::env::remove_var(LAUNCHER_UPDATE_NO_CONSOLE_ENV);
-        } else {
-            HAS_CONSOLE.store(AttachConsole(ATTACH_PARENT_PROCESS) != 0, Ordering::Relaxed);
-        }
+        HAS_CONSOLE.store(AttachConsole(ATTACH_PARENT_PROCESS) != 0, Ordering::Relaxed);
     }
     setup_environment()?;
     let _log_guard = initialize_logging()?;
@@ -1919,9 +367,6 @@ fn main() -> Result<()> {
 
     info!("=== AzurPilot starting ===");
     info!("Launcher log file: log/{}", today_launcher_log_filename());
-    if preview_no_update {
-        info!("Preview no-update mode enabled; skipping launcher update check");
-    }
     if preview_crash {
         info!("Preview crash mode enabled; splash will stop on an artificial error state");
     }
@@ -1938,19 +383,14 @@ fn main() -> Result<()> {
 
     let backend = Arc::new(Mutex::new(None));
     let allow_exit = Arc::new(AtomicBool::new(false));
-    let launch_blocked = Arc::new(AtomicBool::new(false));
     let setup_cancel_requested = Arc::new(AtomicBool::new(false));
-    let setup_running = Arc::new(AtomicBool::new(false));
     let setup_completed = Arc::new(AtomicBool::new(false));
-    let startup_cleanup_started = Arc::new(AtomicBool::new(false));
     let recreating_main_window = Arc::new(AtomicBool::new(false));
 
     let allow_exit_for_setup = allow_exit.clone();
-    let launch_blocked_for_setup = launch_blocked.clone();
     let recreating_main_window_for_single_instance = recreating_main_window.clone();
     let recreating_main_window_for_setup = recreating_main_window.clone();
     let recreating_main_window_for_run = recreating_main_window.clone();
-    let launch_blocked_for_run = launch_blocked.clone();
     let start_minimized_for_run = start_minimized;
 
     info!("Starting Webview...");
@@ -1988,25 +428,6 @@ fn main() -> Result<()> {
             },
         ))
         .setup(move |app| {
-            match time_bomb_expiration_message() {
-                Ok(Some(message)) => {
-                    launch_blocked_for_setup.store(true, Ordering::SeqCst);
-                    allow_exit_for_setup.store(true, Ordering::SeqCst);
-                    let app_handle = app.handle().clone();
-                    app.dialog()
-                        .message(message)
-                        .title(t!("dialog.test_ended"))
-                        .show(move |_| {
-                            app_handle.exit(0);
-                        });
-                    return Ok(());
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    warn!("Unable to verify test expiration time: {:?}", err);
-                }
-            }
-
             create_main_window(&app.handle(), port)?;
 
             // Windows and macOS: create system tray
@@ -2111,11 +532,6 @@ fn main() -> Result<()> {
         .run(move |app_handle, event| {
             match event {
                 tauri::RunEvent::Ready => {
-                    if launch_blocked_for_run.load(Ordering::SeqCst) {
-                        debug!("Launch blocked by test expiration");
-                        return;
-                    }
-
                     debug!("RunEvent::Ready");
                     let allow_exit = allow_exit.clone();
                     let allow_exit_for_ctrlc = allow_exit.clone();
@@ -2129,12 +545,10 @@ fn main() -> Result<()> {
                     let backend = backend.clone();
                     let webui_config = webui_config.clone();
                     let setup_cancel_requested = setup_cancel_requested.clone();
-                    let setup_running = setup_running.clone();
                     let setup_completed = setup_completed.clone();
                     let recreating_main_window_for_notify = recreating_main_window_for_run.clone();
                     let start_minimized = start_minimized_for_run;
                     thread::spawn(move || {
-                        setup_running.store(true, Ordering::SeqCst);
                         let splash = app_handle.get_webview_window("splash").unwrap();
                         initialize_splash(&splash, !start_minimized);
                         let last_progress = Cell::new(0u8);
@@ -2157,44 +571,6 @@ fn main() -> Result<()> {
                             )),
                         );
 
-                        if !preview_no_update {
-                            let launcher_progress = Cell::new(0u8);
-                            let mut launcher_status_updater = |mut update: SplashUpdate| {
-                                update.progress = update.progress.max(launcher_progress.get());
-                                launcher_progress.set(update.progress);
-                                update_splash(&splash, &update);
-                            };
-
-                            match check_launcher_update_and_restart(&mut launcher_status_updater) {
-                                Ok(true) => {
-                                    info!("Launcher update installed, restarting");
-                                    setup_completed.store(true, Ordering::SeqCst);
-                                    setup_running.store(false, Ordering::SeqCst);
-                                    allow_exit.store(true, Ordering::SeqCst);
-                                    app_handle.exit(0);
-                                    return;
-                                }
-                                Ok(false) => {}
-                                Err(e) => {
-                                    warn!("Required launcher update failed: {e:#}");
-                                    if start_minimized {
-                                        let _ = reveal_window(&splash);
-                                    }
-                                    launcher_status_updater(SplashUpdate::error(
-                                        t!("launcher_update.failed"),
-                                        t!(
-                                            "launcher_update.failed_detail",
-                                            error = format!("{e:#}")
-                                        ),
-                                        launcher_progress.get().max(8),
-                                    ));
-                                    setup_completed.store(true, Ordering::SeqCst);
-                                    setup_running.store(false, Ordering::SeqCst);
-                                    return;
-                                }
-                            }
-                        }
-
                         if preview_crash {
                             if start_minimized {
                                 let _ = reveal_window(&splash);
@@ -2212,7 +588,6 @@ fn main() -> Result<()> {
                                 )),
                             );
                             setup_completed.store(true, Ordering::SeqCst);
-                            setup_running.store(false, Ordering::SeqCst);
                             return;
                         }
                         if let Err(e) = setup_alas_repo(
@@ -2221,7 +596,6 @@ fn main() -> Result<()> {
                             preview_no_update,
                         ) {
                             error!("{e}");
-                            setup_running.store(false, Ordering::SeqCst);
                             if setup_cancel_requested.load(Ordering::SeqCst) {
                                 return;
                             }
@@ -2248,55 +622,10 @@ fn main() -> Result<()> {
                                 crate::setup::get_tip()
                             )),
                         );
-                        let mut backend_recovery_used = false;
-                        let backend_result = loop {
-                            match ManagedBackend::new(&webui_config) {
-                                Ok(backend) => break Ok(backend),
-                                Err(error)
-                                    if !backend_recovery_used
-                                        && is_backend_startup_timeout(&error) =>
-                                {
-                                    backend_recovery_used = true;
-                                    if setup_cancel_requested.load(Ordering::SeqCst) {
-                                        break Err(error);
-                                    }
-
-                                    warn!(
-                                        "Backend startup timed out; rebuilding .venv and retrying once"
-                                    );
-                                    if let Err(recovery_error) = rebuild_venv_and_sync_dependencies(
-                                        &mut status_updater,
-                                        setup_cancel_requested.clone(),
-                                    ) {
-                                        break Err(recovery_error.context(
-                                            "Failed to rebuild .venv after backend startup timeout",
-                                        ));
-                                    }
-
-                                    info!(
-                                        "Retrying gui.py after rebuilding dependencies on http://127.0.0.1:{port}/"
-                                    );
-                                    status_updater(
-                                        SplashUpdate::loading(
-                                            t!("splash.starting"),
-                                            t!("splash.webui_init_slow"),
-                                            97,
-                                        )
-                                        .with_subtitle(format!(
-                                            "{} | Tips:{}",
-                                            t!("splash.starting_backend"),
-                                            crate::setup::get_tip()
-                                        )),
-                                    );
-                                }
-                                Err(error) => break Err(error),
-                            }
-                        };
-                        let b = match backend_result {
+                        let b = match ManagedBackend::new(&webui_config) {
                             Ok(backend) => backend,
                             Err(e) => {
                                 error!("{e}");
-                                setup_running.store(false, Ordering::SeqCst);
                                 if setup_cancel_requested.load(Ordering::SeqCst) {
                                     return;
                                 }
@@ -2354,21 +683,18 @@ fn main() -> Result<()> {
                             reveal_window(&window).unwrap();
                         }
                         setup_completed.store(true, Ordering::SeqCst);
-                        setup_running.store(false, Ordering::SeqCst);
                     });
                 }
                 tauri::RunEvent::ExitRequested { api, .. } => {
-                    if !setup_completed.load(Ordering::SeqCst)
-                        && !startup_cleanup_started.load(Ordering::SeqCst)
-                    {
-                        api.prevent_exit();
-                        begin_startup_cleanup(
-                            app_handle.clone(),
-                            allow_exit.clone(),
-                            setup_cancel_requested.clone(),
-                            setup_running.clone(),
-                            startup_cleanup_started.clone(),
-                        );
+                    if !setup_completed.load(Ordering::SeqCst) {
+						info!("Exit requested during setup; stopping setup and exiting without environment rebuild");
+						setup_cancel_requested.store(true, Ordering::SeqCst);
+						allow_exit.store(true, Ordering::SeqCst);
+                        if let Some(ref mut b) = *backend.lock().unwrap() {
+							if let Err(e) = b.terminate() {
+								warn!("Failed to terminate backend process: {:?}", e);
+							}
+						}
                         return;
                     }
 
@@ -2407,14 +733,10 @@ fn main() -> Result<()> {
                     debug!("Window {} close requested", label);
 
                     if label == "splash" && !setup_completed.load(Ordering::SeqCst) {
-                        api.prevent_close();
-                        begin_startup_cleanup(
-                            app_handle.clone(),
-                            allow_exit.clone(),
-                            setup_cancel_requested.clone(),
-                            setup_running.clone(),
-                            startup_cleanup_started.clone(),
-                        );
+						info!("Splash closed during setup; exiting without environment rebuild");
+						setup_cancel_requested.store(true, Ordering::SeqCst);
+						allow_exit.store(true, Ordering::SeqCst);
+						app_handle.exit(0);
                         return;
                     }
 

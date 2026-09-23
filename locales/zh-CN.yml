@@ -100,8 +100,10 @@ dialog:
   cleanup_failed_detail: "部分文件仍被占用或无法删除，请关闭相关进程后重试。\n\n%{error}"
   test_ended: "测试已结束"
   nodejs_missing_title: "未检测到 Node.js"
-  nodejs_missing_message: "未检测到 Node.js。是否现在下载并安装？"
-  nodejs_install: "安装"
+  nodejs_missing_message: "未检测到 Node.js。是否下载到启动器自己的目录？不影响系统已有的 Node.js。"
+  nodejs_install: "下载到达标目录"
+  nodejs_outdated_title: "Node.js 版本过低"
+  nodejs_outdated_message: "当前 Node.js %{found}，前端构建需要 %{minimum} 或更高版本。是否下载一份达标版本？\n\n会装到启动器自己的目录，不影响系统已有的 Node.js。"
   nodejs_not_now: "暂不安装"
   nodejs_install_failed: "Node.js 安装失败"
   nodejs_install_failed_detail: "无法自动安装 Node.js。请重试或手动安装。\n\n%{error}"
@@ -111,7 +113,7 @@ dialog:
   starting: "正在启动"
   startup_failed: "启动失败"
   repo_setup_failed: "无法准备环境。您可以下载下方的启动器日志以查看详细错误。\n\n%{error}"
-  backend_launch_failed: "无法启动本地服务。请检查配置的端口是否已被占用。\n\n%{error}"
+  backend_launch_failed: "无法启动本地服务，可重试或查看日志了解详情。\n\n%{error}"
 
 tray:
   toggle_visibility: "显示 / 隐藏"

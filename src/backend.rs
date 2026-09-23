@@ -1,21 +1,28 @@
 use std::{
     collections::BTreeSet,
+    io::Read as _,
     net::TcpStream,
+    path::{Path, PathBuf},
     process::{Command, ExitStatus},
     thread::sleep,
     time::Duration,
 };
 
 use anyhow::{anyhow, Result};
+use chrono::Local;
 use command_group::{CommandGroup, GroupChild};
 use serde_json::Value as JsonValue;
 use tracing::{info, warn};
 
-use crate::setup::{isolate_python_child_environment, venv_python};
+use crate::setup::{alas_repo_dir, isolate_python_child_environment, venv_python};
 use crate::{launcher_trust_secret, TRUST_SECRET_ENV};
 use crate::window_util::CreateNoWindow as _;
 
 const BACKEND_STARTUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// gui.py 在启动失败时写下的日志标记。
+const BACKEND_FAILURE_LOG_MARKER: &str = "[GUI] AzurPilot Web服务启动失败：";
+/// 读取日志尾部的上限，失败原因位于文件末尾。
+const BACKEND_FAILURE_LOG_TAIL_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug)]
 pub(crate) struct BackendStartupTimeout {
@@ -33,10 +40,6 @@ impl std::fmt::Display for BackendStartupTimeout {
 }
 
 impl std::error::Error for BackendStartupTimeout {}
-
-pub(crate) fn is_backend_startup_timeout(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<BackendStartupTimeout>().is_some()
-}
 
 #[derive(Clone, Debug)]
 pub struct WebuiLaunchConfig {
@@ -191,11 +194,7 @@ impl ManagedBackend {
             }
             if let Some(child) = res.child.as_mut() {
                 if let Some(status) = child.try_wait()? {
-                    return Err(anyhow!(
-                        "Backend exited before port {} was ready: {}",
-                        config.port,
-                        status
-                    ));
+                    return Err(backend_exit_error(config, &status));
                 }
             }
             sleep(Duration::from_millis(100));
@@ -367,6 +366,75 @@ impl Drop for ManagedBackend {
     }
 }
 
+/// 将子进程异常退出表述为可读原因：优先取 gui.py 写在日志里的失败原因，
+/// 取不到时退回端口与退出码。
+fn backend_exit_error(config: &WebuiLaunchConfig, status: &ExitStatus) -> anyhow::Error {
+    match read_backend_failure_reason() {
+        Some(reason) => anyhow!("{reason}（端口 {}，{status}）", config.port),
+        None => anyhow!(
+            "后端在端口 {} 就绪前退出：{status}（未能从日志读取失败原因）",
+            config.port
+        ),
+    }
+}
+
+/// 读取当日 gui 日志尾部记录的失败原因。日志尚未写出时返回 None，由调用方退回通用提示。
+fn read_backend_failure_reason() -> Option<String> {
+    let log_directory = alas_repo_dir().join("log");
+    let today = log_directory.join(format!("{}_gui.txt", Local::now().format("%Y-%m-%d")));
+    let log_path = if today.is_file() {
+        today
+    } else {
+        newest_gui_log(&log_directory)?
+    };
+    read_log_tail(&log_path).and_then(|tail| extract_failure_reason(&tail))
+}
+
+/// 取目录中最新的一份 gui 日志；跨零点启动时当日文件尚未建立。
+fn newest_gui_log(directory: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(directory)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("_gui.txt"))
+        })
+        .max_by_key(|path| path.metadata().and_then(|meta| meta.modified()).ok())
+}
+
+/// 日志为 UTF-8，从尾部按字符边界回溯，避免截断多字节字符。
+fn read_log_tail(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = length.saturating_sub(BACKEND_FAILURE_LOG_TAIL_BYTES);
+    if start > 0 {
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(start)).ok()?;
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    if bytes.contains(&0) {
+        return None;
+    }
+    let text = String::from_utf8(bytes).ok()?;
+    if start == 0 {
+        return Some(text);
+    }
+    // 起始偏移可能落在字符中间，丢掉不完整的首行。
+    Some(text.split_once('\n').map(|(_, tail)| tail.to_owned())?)
+}
+
+/// 日志行形如「时间 | 级别 | [GUI] AzurPilot Web服务启动失败：原因」，取最后一次的原因。
+fn extract_failure_reason(log_tail: &str) -> Option<String> {
+    log_tail
+        .lines()
+        .rev()
+        .find_map(|line| line.split_once(BACKEND_FAILURE_LOG_MARKER))
+        .map(|(_, reason)| reason.trim().to_owned())
+        .filter(|reason| !reason.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,10 +445,45 @@ mod tests {
     }
 
     #[test]
-    fn backend_startup_timeout_is_identified_without_matching_other_errors() {
-        let timeout: anyhow::Error = BackendStartupTimeout { port: 22267 }.into();
+    fn failure_reason_is_extracted_from_a_real_gui_log_line() {
+        // 与 rich 日志实际落盘格式一致：时间 | 级别 | 消息
+        let line = format!("2026-09-21 20:14:40.595 | ERROR | {BACKEND_FAILURE_LOG_MARKER}React 前端构建失败\r");
 
-        assert!(is_backend_startup_timeout(&timeout));
-        assert!(!is_backend_startup_timeout(&anyhow!("other startup error")));
+        assert_eq!(extract_failure_reason(&line).as_deref(), Some("React 前端构建失败"));
+    }
+
+    #[test]
+    fn failure_reason_uses_the_last_recorded_failure() {
+        let tail = format!("{BACKEND_FAILURE_LOG_MARKER}旧原因\n{BACKEND_FAILURE_LOG_MARKER}新原因\n");
+
+        assert_eq!(extract_failure_reason(&tail).as_deref(), Some("新原因"));
+    }
+
+    #[test]
+    fn failure_reason_is_absent_without_the_marker() {
+        assert!(extract_failure_reason("2026-09-21 20:14:40 | INFO | 普通日志\n").is_none());
+        // 标记出现但原因为空时同样不作为原因
+        assert!(extract_failure_reason(&format!("{BACKEND_FAILURE_LOG_MARKER}\n")).is_none());
+    }
+
+    #[test]
+    fn log_tail_drops_the_incomplete_first_line_after_seeking() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("2026-09-21_gui.txt");
+        // 超过读取上限，迫使实现从文件中部定位
+        let mut content = "x".repeat(BACKEND_FAILURE_LOG_TAIL_BYTES as usize + 64);
+        content.push_str("\n第一行完整\n");
+        content.push_str(&format!("{BACKEND_FAILURE_LOG_MARKER}依赖同步失败\n"));
+        std::fs::write(&path, content).expect("write log");
+
+        let tail = read_log_tail(&path).expect("tail");
+
+        assert!(!tail.starts_with("xxxx"), "首行应从字符边界之后开始");
+        assert_eq!(extract_failure_reason(&tail).as_deref(), Some("依赖同步失败"));
+    }
+
+    #[test]
+    fn log_tail_is_absent_for_a_missing_file() {
+        assert!(read_log_tail(Path::new("does-not-exist_gui.txt")).is_none());
     }
 }

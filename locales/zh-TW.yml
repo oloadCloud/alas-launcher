@@ -100,8 +100,10 @@ dialog:
   cleanup_failed_detail: "部分檔案仍被佔用或無法刪除，請關閉相關行程後重試。\n\n%{error}"
   test_ended: "測試已結束"
   nodejs_missing_title: "未偵測到 Node.js"
-  nodejs_missing_message: "未偵測到 Node.js。是否現在下載並安裝？"
-  nodejs_install: "安裝"
+  nodejs_missing_message: "未偵測到 Node.js。是否下載到啟動器自己的目錄？不影響系統現有的 Node.js。"
+  nodejs_install: "下載到達標目錄"
+  nodejs_outdated_title: "Node.js 版本過低"
+  nodejs_outdated_message: "目前 Node.js %{found}，前端建置需要 %{minimum} 或更高版本。是否下載一份達標版本？\n\n會裝到啟動器自己的目錄，不影響系統現有的 Node.js。"
   nodejs_not_now: "暫不安裝"
   nodejs_install_failed: "Node.js 安裝失敗"
   nodejs_install_failed_detail: "無法自動安裝 Node.js。請重試或手動安裝。\n\n%{error}"
@@ -111,7 +113,7 @@ dialog:
   starting: "正在啟動"
   startup_failed: "啟動失敗"
   repo_setup_failed: "無法準備環境。您可以下載下方的啟動器日誌以查看詳細錯誤。\n\n%{error}"
-  backend_launch_failed: "無法啟動本機服務。請檢查設定的連接埠是否已被佔用。\n\n%{error}"
+  backend_launch_failed: "無法啟動本機服務，可重試或查看日誌了解詳情。\n\n%{error}"
 
 tray:
   toggle_visibility: "顯示 / 隱藏"

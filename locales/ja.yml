@@ -100,8 +100,10 @@ dialog:
   cleanup_failed_detail: "一部のファイルが使用中または削除できません。関連プロセスを終了してから再試行してください。\n\n%{error}"
   test_ended: "テストが終了しました"
   nodejs_missing_title: "Node.js が見つかりません"
-  nodejs_missing_message: "Node.js が見つかりません。今すぐダウンロードしてインストールしますか？"
-  nodejs_install: "インストール"
+  nodejs_missing_message: "Node.js が見つかりません。ランチャー専用のディレクトリにダウンロードしますか？システムの Node.js には影響しません。"
+  nodejs_install: "専用ディレクトリへダウンロード"
+  nodejs_outdated_title: "Node.js のバージョンが古いです"
+  nodejs_outdated_message: "現在の Node.js は %{found} ですが、フロントエンドのビルドには %{minimum} 以上が必要です。対応バージョンをダウンロードしますか？\n\nランチャー専用のディレクトリにインストールされ、システムの Node.js には影響しません。"
   nodejs_not_now: "後で"
   nodejs_install_failed: "Node.js のインストールに失敗しました"
   nodejs_install_failed_detail: "Node.js を自動的にインストールできませんでした。再試行するか、手動でインストールしてください。\n\n%{error}"
@@ -111,7 +113,7 @@ dialog:
   starting: "起動中"
   startup_failed: "起動失敗"
   repo_setup_failed: "環境を準備できませんでした。下記からランチャーログをダウンロードして詳細なエラーを確認できます。\n\n%{error}"
-  backend_launch_failed: "ローカルサービスを起動できませんでした。設定されたポートが他のプログラムに使用されていないか確認してください。\n\n%{error}"
+  backend_launch_failed: "ローカルサービスを起動できませんでした。再試行するか、ログを確認してください。\n\n%{error}"
 
 tray:
   toggle_visibility: "表示 / 非表示"

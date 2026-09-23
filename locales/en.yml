@@ -100,8 +100,10 @@ dialog:
   cleanup_failed_detail: "Some files are still in use or cannot be deleted. Please close related processes and try again.\n\n%{error}"
   test_ended: "Test period ended"
   nodejs_missing_title: "Node.js not found"
-  nodejs_missing_message: "Node.js was not found. Would you like to download and install it now?"
-  nodejs_install: "Install"
+  nodejs_missing_message: "Node.js was not found. Download it into the launcher's own directory? Your system Node.js is not affected."
+  nodejs_install: "Download to launcher directory"
+  nodejs_outdated_title: "Node.js version is too old"
+  nodejs_outdated_message: "Node.js %{found} is installed, but building the frontend requires %{minimum} or newer. Download a suitable version?\n\nIt is installed into the launcher's own directory and leaves your system Node.js untouched."
   nodejs_not_now: "Not now"
   nodejs_install_failed: "Node.js installation failed"
   nodejs_install_failed_detail: "Node.js could not be installed automatically. Please try again or install it manually.\n\n%{error}"
@@ -111,7 +113,7 @@ dialog:
   starting: "Starting"
   startup_failed: "Startup failed"
   repo_setup_failed: "Failed to prepare the environment. You can download the launcher log below for details.\n\n%{error}"
-  backend_launch_failed: "Failed to start local service. Please check if the configured port is already in use.\n\n%{error}"
+  backend_launch_failed: "Failed to start the local service. Retry, or check the log for details.\n\n%{error}"
 
 tray:
   toggle_visibility: "Show / Hide"

@@ -185,7 +185,7 @@ fn platform_git_config_path() -> &'static str {
     }
 }
 
-fn alas_repo_dir() -> PathBuf {
+pub fn alas_repo_dir() -> PathBuf {
     // Always check if this is a typical same-folder portable distribution
     let exe_folder = std::env::current_exe()
         .unwrap()
@@ -402,128 +402,10 @@ pub fn setup_alas_repo(
     Ok(())
 }
 
-pub fn rebuild_venv_and_sync_dependencies(
-    mut status_updater: impl FnMut(SplashUpdate),
-    cancel_requested: Arc<AtomicBool>,
-) -> Result<()> {
-    if cancel_requested.load(Ordering::SeqCst) {
-        bail!(t!("setup.cancel_cleaning"));
-    }
-
-    status_updater(
-        SplashUpdate::loading(
-            t!("setup.preparing_env"),
-            t!("setup.backend_timeout_recovery"),
-            97,
-        )
-        .with_subtitle(t!("setup.rebuilding_env", tip = get_tip())),
-    );
-    remove_venv_for_backend_recovery(&cancel_requested)?;
-
-    let bootstrap_uv = bootstrap_uv_path()?;
-    ensure_runtime_tools(&bootstrap_uv, &cancel_requested, &mut status_updater)?;
-    if cancel_requested.load(Ordering::SeqCst) {
-        bail!(t!("setup.cancel_cleaning"));
-    }
-
-    status_updater(
-        SplashUpdate::loading(t!("setup.installing_deps"), t!("setup.verifying_deps"), 97)
-            .with_subtitle(t!("setup.syncing_deps", tip = get_tip())),
-    );
-    uv_sync_project(&mut status_updater, &bootstrap_uv, &cancel_requested)
-}
-
 pub fn get_deploy_config() -> Option<JsonValue> {
     let config_content = fs::read_to_string("./config/deploy.yaml").ok()?;
     let config: JsonValue = serde_yaml::from_str(&config_content).ok()?;
     Some(config)
-}
-
-/// Remove the rebuildable runtime state so the next launch starts clean.
-///
-/// Only `.venv`, the repo's `cache/` and the uv cache go. The checkout, `config/` and `log/`
-/// stay, so a failed dependency sync never costs the user a fresh clone.
-pub fn reset_venv_for_rebuild() -> Result<()> {
-    let repo_dir = alas_repo_dir();
-    kill_runtime_processes(&repo_dir);
-
-    remove_rebuildable_entry(&venv_dir())?;
-    remove_rebuildable_entry(&repo_dir.join("cache"))?;
-    clean_uv_cache()?;
-    Ok(())
-}
-
-/// Delete a rebuildable path, treating an absent one as already clean.
-fn remove_rebuildable_entry(path: &Path) -> Result<()> {
-    if !path.exists() {
-        info!("No {} to remove", path.display());
-        return Ok(());
-    }
-    info!("Removing {}", path.display());
-    remove_runtime_entry_with_retry(path).with_context(|| {
-        t!(
-            "errors.reset_venv_failed",
-            error = path.display().to_string()
-        )
-    })
-}
-
-fn clean_uv_cache() -> Result<()> {
-    let uv = bootstrap_uv_path()?;
-    info!("Cleaning uv cache with {}", uv.display());
-    let mut cmd = Command::new(&uv);
-    cmd.args(["cache", "clean"])
-        .env("UV_NO_PROGRESS", "1")
-        .env_remove("UV_PYTHON");
-    isolate_python_child_environment(&mut cmd);
-    let status = cmd.create_no_window().status().with_context(|| {
-        t!(
-            "errors.uv_cache_cleanup_failed",
-            error = uv.display().to_string()
-        )
-    })?;
-    if !status.success() {
-        bail!(t!("errors.uv_cache_failed"));
-    }
-    Ok(())
-}
-
-fn kill_runtime_processes(repo_dir: &Path) {
-    let current_pid = std::process::id();
-    let sys = sysinfo::System::new_all();
-    for (pid, process) in sys.processes() {
-        if pid.as_u32() == current_pid {
-            continue;
-        }
-
-        let should_kill = process
-            .exe()
-            .map(|exe| path_is_inside(exe, repo_dir))
-            .unwrap_or(false)
-            || process
-                .cwd()
-                .map(|cwd| path_is_inside(cwd, repo_dir))
-                .unwrap_or(false);
-
-        if should_kill {
-            info!(
-                "Killing runtime process {} ({}) before cleanup",
-                pid,
-                process.name().to_string_lossy()
-            );
-            if !process.kill() {
-                warn!("Failed to kill runtime process {}", pid);
-            }
-        }
-    }
-
-    thread::sleep(Duration::from_millis(500));
-}
-
-fn path_is_inside(path: &Path, parent: &Path) -> bool {
-    path.canonicalize()
-        .map(|path| path.starts_with(parent))
-        .unwrap_or(false)
 }
 
 fn remove_runtime_entry(path: &Path) -> Result<()> {
@@ -570,171 +452,6 @@ fn remove_runtime_entry_with_retry(path: &Path) -> Result<()> {
             error = path.display().to_string()
         ))
     }))
-}
-
-fn remove_venv_for_backend_recovery(cancel_requested: &AtomicBool) -> Result<()> {
-    let repo_dir = alas_repo_dir().canonicalize()?;
-    let venv = venv_dir();
-    if !venv.exists() {
-        return Ok(());
-    }
-
-    let venv_metadata = fs::symlink_metadata(&venv)?;
-    if !venv_metadata.is_dir() || is_symlink_or_reparse_point(&venv_metadata) {
-        bail!(t!(
-            "errors.refuse_cleanup",
-            actual = venv.display().to_string(),
-            expected = repo_dir.display().to_string()
-        ));
-    }
-    let venv_target = venv.canonicalize()?;
-    if venv_target == repo_dir || !venv_target.starts_with(&repo_dir) {
-        bail!(t!(
-            "errors.refuse_cleanup",
-            actual = venv_target.display().to_string(),
-            expected = repo_dir.display().to_string()
-        ));
-    }
-
-    remove_venv_path_for_backend_recovery(&venv, cancel_requested).with_context(|| {
-        t!(
-            "errors.reset_venv_failed",
-            error = venv.display().to_string()
-        )
-    })
-}
-
-fn remove_venv_path_for_backend_recovery(venv: &Path, cancel_requested: &AtomicBool) -> Result<()> {
-    if cancel_requested.load(Ordering::SeqCst) {
-        bail!(t!("setup.cancel_cleaning"));
-    }
-    if !venv.exists() {
-        return Ok(());
-    }
-
-    info!("Removing {} after backend startup timeout", venv.display());
-    remove_venv_entry_with_retry(venv, cancel_requested)?;
-    if cancel_requested.load(Ordering::SeqCst) {
-        bail!(t!("setup.cancel_cleaning"));
-    }
-    Ok(())
-}
-
-fn remove_venv_entry_with_retry(path: &Path, cancel_requested: &AtomicBool) -> Result<()> {
-    let mut last_error = None;
-    for attempt in 0..CLEANUP_RETRIES {
-        if cancel_requested.load(Ordering::SeqCst) {
-            bail!(t!("setup.cancel_cleaning"));
-        }
-
-        match remove_venv_entry(path, cancel_requested) {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                last_error = Some(error);
-                if !path.exists() {
-                    return Ok(());
-                }
-                wait_for_venv_recovery_retry(
-                    Duration::from_millis(250 + attempt as u64 * 100),
-                    cancel_requested,
-                )?;
-            }
-        }
-    }
-
-    Err(last_error.unwrap_or_else(|| {
-        anyhow!(t!(
-            "errors.delete_failed",
-            error = path.display().to_string()
-        ))
-    }))
-}
-
-fn remove_venv_entry(path: &Path, cancel_requested: &AtomicBool) -> Result<()> {
-    if cancel_requested.load(Ordering::SeqCst) {
-        bail!(t!("setup.cancel_cleaning"));
-    }
-
-    let metadata = fs::symlink_metadata(path)?;
-    if is_symlink_or_reparse_point(&metadata) {
-        return remove_venv_link_or_reparse_point(path, &metadata);
-    }
-
-    clear_readonly(path)?;
-    if metadata.is_dir() {
-        for entry in fs::read_dir(path)? {
-            if cancel_requested.load(Ordering::SeqCst) {
-                bail!(t!("setup.cancel_cleaning"));
-            }
-            remove_venv_entry(&entry?.path(), cancel_requested)?;
-        }
-        fs::remove_dir(path).with_context(|| {
-            t!(
-                "errors.delete_dir_failed",
-                error = path.display().to_string()
-            )
-        })?;
-    } else {
-        fs::remove_file(path).with_context(|| {
-            t!(
-                "errors.delete_file_failed",
-                error = path.display().to_string()
-            )
-        })?;
-    }
-    Ok(())
-}
-
-fn is_symlink_or_reparse_point(metadata: &fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
-    }
-
-    #[cfg(not(windows))]
-    false
-}
-
-fn remove_venv_link_or_reparse_point(path: &Path, _metadata: &fs::Metadata) -> Result<()> {
-    #[cfg(windows)]
-    let result = if fs::metadata(path)
-        .map(|target_metadata| target_metadata.is_dir())
-        .unwrap_or(false)
-    {
-        fs::remove_dir(path)
-    } else {
-        fs::remove_file(path)
-    };
-
-    #[cfg(not(windows))]
-    let result = fs::remove_file(path);
-
-    result.with_context(|| {
-        t!(
-            "errors.delete_file_failed",
-            error = path.display().to_string()
-        )
-    })
-}
-
-fn wait_for_venv_recovery_retry(delay: Duration, cancel_requested: &AtomicBool) -> Result<()> {
-    let deadline = Instant::now() + delay;
-    while Instant::now() < deadline {
-        if cancel_requested.load(Ordering::SeqCst) {
-            bail!(t!("setup.cancel_cleaning"));
-        }
-        thread::sleep(
-            Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
-        );
-    }
-    Ok(())
 }
 
 fn clear_readonly(path: &Path) -> Result<()> {
@@ -927,7 +644,7 @@ fn run_command_with_retry(
     unreachable!()
 }
 
-fn run_status_command(
+pub fn run_status_command(
     cmd: &mut Command,
     cancel_requested: &AtomicBool,
 ) -> Result<std::process::ExitStatus> {
@@ -1027,7 +744,6 @@ gm.git_install()
             cmd.args(["-c", script])
                 .env("AZURPILOT_BOOTSTRAP_UV", &bootstrap_uv);
             isolate_python_child_environment(&mut cmd);
-            // bypass_proxy_for_child(&mut cmd);
             cmd
         },
         status_updater,
@@ -1453,23 +1169,6 @@ fn ignore_uv_index_env(cmd: &mut Command) {
     }
 }
 
-fn bypass_proxy_for_child(cmd: &mut Command) {
-    for key in [
-        "ALL_PROXY",
-        "all_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "PIP_PROXY",
-        "pip_proxy",
-    ] {
-        cmd.env_remove(key);
-    }
-    // uv falls back to the platform proxy when these variables are absent.
-    cmd.env("NO_PROXY", "*").env("no_proxy", "*");
-}
-
 pub(crate) fn isolate_python_child_environment(cmd: &mut Command) {
     for key in [
         "PYTHONHOME",
@@ -1520,7 +1219,6 @@ fn ensure_deploy_python_dependencies(
             .env("UV_PYTHON_INSTALL_DIR", venv_python_install_dir());
         ignore_uv_index_env(&mut cmd);
         isolate_python_child_environment(&mut cmd);
-        bypass_proxy_for_child(&mut cmd);
 
         let mut elapsed_ticks = 0u16;
         let status = run_status_command_with_tick(&mut cmd, cancel_requested, || {
@@ -1557,7 +1255,6 @@ fn uv_python_env_with_install_dir(cmd: &mut Command, python_install_dir: &Path) 
         .env_remove("UV_PYTHON")
         .env("UV_PYTHON_INSTALL_DIR", python_install_dir);
     isolate_python_child_environment(cmd);
-    bypass_proxy_for_child(cmd);
     if std::env::var_os("UV_PYTHON_INSTALL_MIRROR").is_none() {
         cmd.env(
             "UV_PYTHON_INSTALL_MIRROR",
@@ -2268,35 +1965,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backend_timeout_recovery_removes_only_venv() {
-        let temp_dir = tempfile::tempdir().expect("create temporary repository");
-        let venv = temp_dir.path().join(".venv");
-        let keep = temp_dir.path().join("keep.txt");
-        fs::create_dir_all(venv.join("Lib")).expect("create temporary venv");
-        fs::write(venv.join("Lib").join("package.txt"), "dependency")
-            .expect("write temporary dependency");
-        fs::write(&keep, "keep").expect("write sibling file");
-        let cancel_requested = AtomicBool::new(false);
-
-        remove_venv_path_for_backend_recovery(&venv, &cancel_requested)
-            .expect("remove temporary venv");
-
-        assert!(!venv.exists());
-        assert_eq!(fs::read_to_string(keep).expect("read sibling file"), "keep");
-    }
-
-    #[test]
-    fn backend_timeout_recovery_does_not_remove_venv_after_cancellation() {
-        let temp_dir = tempfile::tempdir().expect("create temporary repository");
-        let venv = temp_dir.path().join(".venv");
-        fs::create_dir_all(&venv).expect("create temporary venv");
-        let cancel_requested = AtomicBool::new(true);
-
-        assert!(remove_venv_path_for_backend_recovery(&venv, &cancel_requested).is_err());
-        assert!(venv.exists());
-    }
-
-    #[test]
     fn test_find_percentage() {
         assert_eq!(Some(8), find_percentage("8%"));
         assert_eq!(Some(25), find_percentage("loading 25%..."));
@@ -2353,7 +2021,6 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--default-index", "https://pypi.org/simple"]));
-        assert_proxy_bypass_env(&command);
         assert_python_environment_isolated(&command);
     }
 
@@ -2365,7 +2032,6 @@ mod tests {
         assert!(command
             .get_envs()
             .any(|(key, value)| key == "UV_PYTHON" && value.is_none()));
-        assert_proxy_bypass_env(&command);
         assert_python_environment_isolated(&command);
     }
 
@@ -2394,24 +2060,6 @@ mod tests {
 
         progress.observe("Downloaded demo-package");
         assert_eq!(progress.downloaded_bytes, 1_572_864);
-    }
-
-    fn assert_proxy_bypass_env(command: &Command) {
-        let no_proxy = command
-            .get_envs()
-            .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case("NO_PROXY"))
-            .and_then(|(_, value)| value.map(|value| value.to_string_lossy().into_owned()));
-        assert_eq!(no_proxy.as_deref(), Some("*"));
-
-        for key in ["ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "PIP_PROXY"] {
-            let value = command
-                .get_envs()
-                .find(|(configured_key, _)| {
-                    configured_key.to_string_lossy().eq_ignore_ascii_case(key)
-                })
-                .map(|(_, value)| value);
-            assert!(matches!(value, Some(None)), "{key} must be removed");
-        }
     }
 
     fn assert_python_environment_isolated(command: &Command) {
