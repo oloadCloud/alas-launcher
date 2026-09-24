@@ -1569,17 +1569,12 @@ mod tests {
         {
             assert!(titlebar_script.contains("touch-action:none"));
             assert!(titlebar_script.contains("addEventListener('pointerdown'"));
-            assert!(titlebar_script.contains("-webkit-app-region:drag"));
+            assert!(titlebar_script.contains("window_start_dragging"));
             assert!(titlebar_script.contains("-webkit-app-region:no-drag"));
-            assert!(titlebar_script.contains("webviewDraggableRegionsEnabled"));
-            assert!(titlebar_script.contains("if (webviewDraggableRegionsEnabled)"));
             assert!(titlebar_script.contains(
                 ".alas-titlebar-drag-zone{position:absolute;inset:0 148px 0 0;height:100%;pointer-events:none"
             ));
-            assert!(titlebar_script.contains(".alas-titlebar-drag-segment{"));
-            assert!(titlebar_script.contains("const rebuildDragSegments = () =>"));
-            assert!(titlebar_script.contains("getComputedStyle(element).cursor !== 'pointer'"));
-            assert!(titlebar_script.contains("dragZone.replaceChildren(fragment)"));
+            assert!(titlebar_script.contains("getComputedStyle(element).cursor === 'pointer'"));
             assert!(titlebar_script.contains("min-height:28px"));
             assert!(titlebar_script.contains("background:rgba(250,250,247,.78)"));
             assert!(titlebar_script.contains(".icon-close{color:#e64f58}"));
@@ -1591,8 +1586,8 @@ mod tests {
             assert!(!titlebar_script.contains("alas-island-open"));
             assert!(titlebar_script.contains("__ALAS_OPEN_CLOSE_PROMPT"));
             assert!(titlebar_script.contains("window_exit_application"));
-            #[cfg(windows)]
-            assert!(titlebar_script.contains("const webviewDraggableRegionsEnabled = true;"));
+            assert!(!titlebar_script.contains("addEventListener('scroll'"));
+            assert!(!titlebar_script.contains("MutationObserver"));
         }
     }
 
@@ -4350,9 +4345,9 @@ fn main_window_titlebar_injection_script() -> String {
         s.push_str("const i18n = ");
         s.push_str(&i18n_json);
         s.push_str(if cfg!(windows) {
-            ";const webviewDraggableRegionsEnabled = true;const closePromptEnabled = true;"
+            ";const closePromptEnabled = true;"
         } else {
-            ";const webviewDraggableRegionsEnabled = false;const closePromptEnabled = false;"
+            ";const closePromptEnabled = false;"
         });
         s.push_str(r#";
         const invoke =
@@ -4368,16 +4363,15 @@ fn main_window_titlebar_injection_script() -> String {
             if (!document.getElementById('alas-launcher-titlebar-style')) {
                 const style = document.createElement('style');
                 style.id = 'alas-launcher-titlebar-style';
-                style.textContent = ':root{--alas-titlebar-height:56px}#alas-launcher-titlebar{position:fixed;top:0;left:0;right:0;height:var(--alas-titlebar-height);z-index:2147483647;user-select:none;pointer-events:none;background:transparent}#alas-launcher-titlebar *{box-sizing:border-box}.alas-titlebar-drag-zone{position:absolute;inset:0 148px 0 0;height:100%;pointer-events:none;background:transparent;touch-action:none}.alas-titlebar-drag-segment{position:absolute;top:0;bottom:0;pointer-events:auto;background:transparent;touch-action:none;app-region:drag;-webkit-app-region:drag}.header-icon,.header-icon *{app-region:no-drag;-webkit-app-region:no-drag}.header-icon{display:flex;align-items:center;gap:3px;padding:3px 4px;position:absolute;top:10px;right:10px;height:36px;pointer-events:auto;border:1px solid rgba(255,255,255,.92);border-radius:18px;background:rgba(250,250,247,.78);box-shadow:0 4px 14px rgba(61,79,97,.1),inset 0 1px 0 rgba(255,255,255,.36);backdrop-filter:blur(16px) saturate(1.2);-webkit-backdrop-filter:blur(16px) saturate(1.2)}.icon{width:28px;height:28px;min-width:28px;min-height:28px;margin:0;padding:0;line-height:1;border-radius:12px;border:none;background:transparent;color:#727b86;cursor:pointer;flex:0 0 auto;position:relative;transition:transform 140ms cubic-bezier(.23,1,.32,1),background-color 140ms ease,color 140ms ease;display:inline-flex;align-items:center;justify-content:center}.icon:hover{color:#202832;background:rgba(255,255,255,.72)}.icon:active{transform:scale(.96)}.icon-close{color:#e64f58}.icon-close:hover{color:#b5202e;background:rgba(244,91,91,.15)}.icon svg{width:11px;height:11px;stroke:currentColor;fill:none;stroke-width:1.2;stroke-linecap:round;stroke-linejoin:round;opacity:1}';
+                style.textContent = ':root{--alas-titlebar-height:56px}#alas-launcher-titlebar{position:fixed;top:0;left:0;right:0;height:var(--alas-titlebar-height);z-index:2147483647;user-select:none;pointer-events:none;background:transparent}#alas-launcher-titlebar *{box-sizing:border-box}.alas-titlebar-drag-zone{position:absolute;inset:0 148px 0 0;height:100%;pointer-events:none;background:transparent;touch-action:none}.header-icon,.header-icon *{app-region:no-drag;-webkit-app-region:no-drag}.header-icon{display:flex;align-items:center;gap:3px;padding:3px 4px;position:absolute;top:10px;right:10px;height:36px;pointer-events:auto;border:1px solid rgba(255,255,255,.92);border-radius:18px;background:rgba(250,250,247,.78);box-shadow:0 4px 14px rgba(61,79,97,.1),inset 0 1px 0 rgba(255,255,255,.36);backdrop-filter:blur(16px) saturate(1.2);-webkit-backdrop-filter:blur(16px) saturate(1.2)}.icon{width:28px;height:28px;min-width:28px;min-height:28px;margin:0;padding:0;line-height:1;border-radius:12px;border:none;background:transparent;color:#727b86;cursor:pointer;flex:0 0 auto;position:relative;transition:transform 140ms cubic-bezier(.23,1,.32,1),background-color 140ms ease,color 140ms ease;display:inline-flex;align-items:center;justify-content:center}.icon:hover{color:#202832;background:rgba(255,255,255,.72)}.icon:active{transform:scale(.96)}.icon-close{color:#e64f58}.icon-close:hover{color:#b5202e;background:rgba(244,91,91,.15)}.icon svg{width:11px;height:11px;stroke:currentColor;fill:none;stroke-width:1.2;stroke-linecap:round;stroke-linejoin:round;opacity:1}';
                 style.textContent += '#alas-close-menu{position:fixed;top:8px;right:10px;z-index:2147483647;width:272px;padding:14px;border:1px solid rgba(255,255,255,.9);border-radius:20px;background:rgba(250,250,247,.94);box-shadow:0 18px 46px rgba(46,58,72,.2),inset 0 1px 0 rgba(255,255,255,.7);backdrop-filter:blur(20px) saturate(1.18);-webkit-backdrop-filter:blur(20px) saturate(1.18);color:#202832;opacity:0;pointer-events:none;transform:translateY(-6px) scale(.96);transform-origin:calc(100% - 64px) 0;transition:opacity 140ms ease,transform 180ms cubic-bezier(.23,1,.32,1);app-region:no-drag;-webkit-app-region:no-drag}#alas-close-menu.is-open{opacity:1;pointer-events:auto;transform:translateY(0) scale(1)}#alas-close-menu *{box-sizing:border-box;app-region:no-drag;-webkit-app-region:no-drag}#alas-close-menu-title{margin:0 0 12px;font:500 13px/1.55 "MiSans",sans-serif;color:rgba(32,40,50,.82)}#alas-close-menu-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px}#alas-close-menu button{display:flex;align-items:center;justify-content:center;min-width:0;min-height:36px;margin:0;padding:0 12px;border:1px solid rgba(92,105,120,.16);border-radius:11px;background:rgba(105,118,133,.08);color:#394451;font:600 12px/1 "MiSans",sans-serif;cursor:pointer;transition:background-color 140ms ease,color 140ms ease,transform 140ms cubic-bezier(.23,1,.32,1)}#alas-close-menu button:hover{transform:translateY(-1px);background:rgba(105,118,133,.14)}#alas-close-menu button:active{transform:scale(.98)}#alas-close-menu button:disabled{opacity:.55;cursor:default;transform:none}#alas-close-menu .alas-close-confirm{border-color:rgba(205,62,69,.28);background:#d94b4b;color:#fff}#alas-close-menu .alas-close-confirm:hover{background:#c93e3e;color:#fff}';
                 document.head.appendChild(style);
             }
             const titlebar = document.createElement('div');
             titlebar.id = 'alas-launcher-titlebar';
-            titlebar.innerHTML = '<div class="alas-titlebar-drag-zone" aria-hidden="true"><div class="alas-titlebar-drag-segment" style="left:0;right:0"></div></div><div class="header-icon"><button type="button" class="icon icon-hide" data-action="hide" aria-label="'+i18n.hideLabel+'" title="'+i18n.hideLabel+'"><svg viewBox="0 0 6 6"><rect x="1" y="1" width="4" height="4" rx="1"/><path d="M2 3h2"/></svg></button><button type="button" class="icon icon-minimize" data-action="minimize" aria-label="'+i18n.minimizeLabel+'" title="'+i18n.minimizeTitle+'"><svg viewBox="0 0 6 6"><line x1="1" y1="3" x2="5" y2="3"/></svg></button><button type="button" class="icon icon-maximize" data-action="maximize" aria-label="'+i18n.maximizeLabel+'" title="'+i18n.maximizeTitle+'"><svg viewBox="0 0 6 6" class="svg-restore" style="display:none"><polyline points="1,3 1,1 3,1"/><polyline points="3,5 5,5 5,3"/></svg><svg viewBox="0 0 6 6" class="svg-maximize"><polyline points="1,2.5 1,1 2.5,1"/><polyline points="3.5,5 5,5 5,3.5"/></svg></button><button type="button" class="icon icon-close" data-action="close" aria-label="'+i18n.closeLabel+'" title="'+i18n.closeTitle+'"><svg viewBox="0 0 6 6"><line x1="1" y1="1" x2="5" y2="5"/><line x1="5" y1="1" x2="1" y2="5"/></svg></button></div>';
+            titlebar.innerHTML = '<div class="alas-titlebar-drag-zone" aria-hidden="true"></div><div class="header-icon"><button type="button" class="icon icon-hide" data-action="hide" aria-label="'+i18n.hideLabel+'" title="'+i18n.hideLabel+'"><svg viewBox="0 0 6 6"><rect x="1" y="1" width="4" height="4" rx="1"/><path d="M2 3h2"/></svg></button><button type="button" class="icon icon-minimize" data-action="minimize" aria-label="'+i18n.minimizeLabel+'" title="'+i18n.minimizeTitle+'"><svg viewBox="0 0 6 6"><line x1="1" y1="3" x2="5" y2="3"/></svg></button><button type="button" class="icon icon-maximize" data-action="maximize" aria-label="'+i18n.maximizeLabel+'" title="'+i18n.maximizeTitle+'"><svg viewBox="0 0 6 6" class="svg-restore" style="display:none"><polyline points="1,3 1,1 3,1"/><polyline points="3,5 5,5 5,3"/></svg><svg viewBox="0 0 6 6" class="svg-maximize"><polyline points="1,2.5 1,1 2.5,1"/><polyline points="3.5,5 5,5 5,3.5"/></svg></button><button type="button" class="icon icon-close" data-action="close" aria-label="'+i18n.closeLabel+'" title="'+i18n.closeTitle+'"><svg viewBox="0 0 6 6"><line x1="1" y1="1" x2="5" y2="5"/><line x1="5" y1="1" x2="1" y2="5"/></svg></button></div>';
             document.body.dataset.alasCustomTitlebar = 'true';
             document.body.prepend(titlebar);
-            const dragZone = titlebar.querySelector('.alas-titlebar-drag-zone');
             const maximizeButton = titlebar.querySelector('[data-action="maximize"]');
             let closeMenu = document.getElementById('alas-close-menu');
             if (!closeMenu) {
@@ -4424,87 +4418,46 @@ fn main_window_titlebar_injection_script() -> String {
                 if (event.key === 'Escape' && closeMenu.classList.contains('is-open')) setCloseMenuOpen(false);
             });
             const interactiveSelector = 'a[href],button,input,select,textarea,summary,label[for],[role="button"],[role="link"],[contenteditable="true"],[tabindex]:not([tabindex="-1"]),[onclick]';
-            if (webviewDraggableRegionsEnabled) {
-                // Draggable regions swallow pointer events; no-drag holes keep the app controls clickable while the strip drags the window.
-                const noDragStyle = document.createElement('style');
-                noDragStyle.id = 'alas-launcher-no-drag-style';
-                noDragStyle.textContent = interactiveSelector + ',[data-alas-no-drag]{app-region:no-drag;-webkit-app-region:no-drag}'
-                    + '#alas-launcher-titlebar .alas-titlebar-drag-zone,#alas-launcher-titlebar .alas-titlebar-drag-segment{pointer-events:none;app-region:drag;-webkit-app-region:drag}'
-                    + '#alas-launcher-titlebar .alas-titlebar-drag-zone{user-select:none}';
-                document.head.appendChild(noDragStyle);
-            }
-            let lastDragSegmentKey = '';
-            const rebuildDragSegments = () => {
-                if (webviewDraggableRegionsEnabled) return;
-                const dragRect = dragZone.getBoundingClientRect();
-                const dragWidth = Math.max(0, dragRect.width);
-                const exclusions = [];
-                document.body.querySelectorAll('*').forEach(element => {
-                    if (titlebar.contains(element) || element.closest('#alas-close-menu')) return;
-                    const rect = element.getBoundingClientRect();
-                    if (rect.width <= 0 || rect.height <= 0 || rect.bottom <= dragRect.top || rect.top >= dragRect.bottom || rect.right <= dragRect.left || rect.left >= dragRect.right) return;
-                    if (!element.matches(interactiveSelector) && getComputedStyle(element).cursor !== 'pointer') return;
-                    const left = Math.max(0, Math.floor(rect.left - dragRect.left) - 3);
-                    const right = Math.min(dragWidth, Math.ceil(rect.right - dragRect.left) + 3);
-                    if (right > left) exclusions.push([left, right]);
-                });
-                exclusions.sort((a, b) => a[0] - b[0]);
-                const merged = [];
-                exclusions.forEach(interval => {
-                    const previous = merged[merged.length - 1];
-                    if (previous && interval[0] <= previous[1]) previous[1] = Math.max(previous[1], interval[1]);
-                    else merged.push(interval);
-                });
-                // Segments are a pure function of the merged intervals and the available width;
-                // identical input means the DOM already matches, so skip the rewrite.
-                const dragSegmentKey = dragWidth + '|' + merged.map(interval => interval[0] + ':' + interval[1]).join(',');
-                if (dragSegmentKey === lastDragSegmentKey) return;
-                lastDragSegmentKey = dragSegmentKey;
-                const fragment = document.createDocumentFragment();
-                const appendSegment = (left, right) => {
-                    if (right - left < 4) return;
-                    const segment = document.createElement('div');
-                    segment.className = 'alas-titlebar-drag-segment';
-                    segment.style.left = left + 'px';
-                    segment.style.width = (right - left) + 'px';
-                    fragment.appendChild(segment);
-                };
-                let cursor = 0;
-                merged.forEach(interval => {
-                    appendSegment(cursor, interval[0]);
-                    cursor = Math.max(cursor, interval[1]);
-                });
-                appendSegment(cursor, dragWidth);
-                dragZone.replaceChildren(fragment);
+            const isInteractiveElement = element => {
+                if (!element || !(element instanceof Element)) return false;
+                return Boolean(
+                    element.closest(interactiveSelector)
+                    || element.closest('[data-alas-no-drag]')
+                    || (getComputedStyle(element).cursor === 'pointer' && !element.closest('#alas-launcher-titlebar'))
+                );
             };
-            let dragSegmentFrame = 0;
-            const scheduleDragSegmentRebuild = () => {
-                cancelAnimationFrame(dragSegmentFrame);
-                dragSegmentFrame = requestAnimationFrame(rebuildDragSegments);
-            };
-            const dragSegmentObserver = new MutationObserver(mutations => {
-                if (mutations.some(mutation => !titlebar.contains(mutation.target))) scheduleDragSegmentRebuild();
-            });
-            dragSegmentObserver.observe(document.body, {
-                subtree: true,
-                childList: true,
-                characterData: true,
-                attributes: true,
-                attributeFilter: ['class', 'style', 'hidden', 'disabled', 'href', 'role', 'tabindex'],
-            });
-            // Only a scroll that moves content under the fixed titlebar can change the drag zones;
-            // a container lying entirely outside that band leaves the segments as they are.
-            const scrollAffectsTitlebar = event => {
+
+            document.addEventListener('pointerdown', event => {
+                if (!event.isPrimary || event.button !== 0) return;
+                const titlebarHeight = 56;
+                const reservedRight = 148;
+                if (event.clientY > titlebarHeight || event.clientX > window.innerWidth - reservedRight) return;
                 const target = event.target;
-                if (!(target instanceof Element) || target === document.documentElement || target === document.body) return true;
-                const rect = target.getBoundingClientRect();
-                const band = dragZone.getBoundingClientRect();
-                return rect.bottom > band.top && rect.top < band.bottom && rect.right > band.left && rect.left < band.right;
-            };
-            document.addEventListener('scroll', event => {
-                if (scrollAffectsTitlebar(event)) scheduleDragSegmentRebuild();
-            }, { capture: true, passive: true });
-            rebuildDragSegments();
+                if (!target || !(target instanceof Element)) return;
+                if (titlebar.contains(target) || target.closest('#alas-close-menu')) return;
+                if (isInteractiveElement(target)) return;
+                event.preventDefault();
+                invoke('window_start_dragging').catch(error => {
+                    console.error('Failed to start dragging from titlebar', error);
+                });
+            }, { capture: true });
+
+            document.addEventListener('dblclick', async event => {
+                const titlebarHeight = 56;
+                const reservedRight = 148;
+                if (event.clientY > titlebarHeight || event.clientX > window.innerWidth - reservedRight) return;
+                const target = event.target;
+                if (!target || !(target instanceof Element)) return;
+                if (titlebar.contains(target) || target.closest('#alas-close-menu')) return;
+                if (isInteractiveElement(target)) return;
+                try {
+                    await invoke('window_toggle_maximize');
+                    await syncMaximizeState();
+                } catch (error) {
+                    console.error('Failed to toggle maximize from titlebar', error);
+                }
+            }, { capture: true });
+
             const syncMaximizeState = async () => {
                 if (!maximizeButton) return;
                 try {
@@ -4533,18 +4486,7 @@ fn main_window_titlebar_injection_script() -> String {
                     }
                 });
             });
-            dragZone.addEventListener('pointerdown', event => {
-                if (!event.isPrimary || event.button !== 0 || event.target.closest('button')) return;
-                if (webviewDraggableRegionsEnabled) return;
-                event.preventDefault();
-                invoke('window_start_dragging').catch(error => { console.error('Failed to start dragging from titlebar', error); });
-            });
-            dragZone.addEventListener('dblclick', async event => {
-                if (event.target.closest('button')) return;
-                try { await invoke('window_toggle_maximize'); await syncMaximizeState(); }
-                catch (error) { console.error('Failed to toggle maximize from titlebar', error); }
-            });
-            window.addEventListener('resize', () => { scheduleDragSegmentRebuild(); void syncMaximizeState(); });
+            window.addEventListener('resize', () => { void syncMaximizeState(); });
             void syncMaximizeState();
         };
         ensureTitlebar();
