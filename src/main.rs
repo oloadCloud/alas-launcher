@@ -60,7 +60,7 @@ const MENUBAR_ICON_2X: &[u8] = include_bytes!("../icons/menubar@2x.png");
 #[cfg(target_os = "macos")]
 const MENUBAR_ICON_1X: &[u8] = include_bytes!("../icons/menubar.png");
 #[cfg(windows)]
-const WINDOWS_TRAY_ICON: &[u8] = include_bytes!("../icons/icon.png");
+const WINDOWS_TRAY_ICON: &[u8] = include_bytes!("../icons/qicon.png");
 const SPLASH_BG_IMAGE: &[u8] = include_bytes!("../bg/bg.webp");
 const MI_SANS_FONT: &[u8] = include_bytes!("../fonts/MiSansLauncher.ttf");
 const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
@@ -2463,6 +2463,20 @@ fn main_window_titlebar_injection_script() -> String {
         if (typeof invoke !== 'function') {
             return;
         }
+        const syncMaximizeState = async () => {
+            const btn = document.querySelector('#alas-launcher-titlebar [data-action="maximize"]');
+            if (!btn) return;
+            try {
+                const maximized = await invoke('window_is_maximized');
+                btn.dataset.maximized = maximized ? 'true' : 'false';
+                btn.title = maximized ? i18n.restoreTitle : i18n.maximizeActionTitle;
+                btn.setAttribute('aria-label', maximized ? i18n.restoreLabel : i18n.maximizeLabelText);
+                btn.querySelector('.svg-maximize').style.display = maximized ? 'none' : '';
+                btn.querySelector('.svg-restore').style.display = maximized ? '' : 'none';
+            } catch (e) {
+                console.error('Failed to sync maximize state', e);
+            }
+        };
         const ensureTitlebar = () => {
             const html = document.documentElement;
             if (!html) return;
@@ -2482,21 +2496,6 @@ fn main_window_titlebar_injection_script() -> String {
             titlebar.id = 'alas-launcher-titlebar';
             titlebar.innerHTML = `<div class="header-icon"><button type="button" class="icon icon-hide" data-action="hide" aria-label="${i18n.hideLabel}" title="${i18n.hideLabel}"><svg viewBox="0 0 10 10"><line x1="2.5" y1="2.5" x2="7.5" y2="7.5"/><polyline points="4,7.5 7.5,7.5 7.5,4"/></svg></button><button type="button" class="icon icon-minimize" data-action="minimize" aria-label="${i18n.minimizeLabel}" title="${i18n.minimizeTitle}"><svg viewBox="0 0 10 10"><line x1="1.5" y1="5" x2="8.5" y2="5"/></svg></button><button type="button" class="icon icon-maximize" data-action="maximize" aria-label="${i18n.maximizeLabel}" title="${i18n.maximizeTitle}"><svg viewBox="0 0 10 10" class="svg-restore" style="display:none"><path d="M3.5 1.5h5v5"/><rect x="1.5" y="3.5" width="5" height="5"/></svg><svg viewBox="0 0 10 10" class="svg-maximize"><rect x="1.5" y="1.5" width="7" height="7"/></svg></button><button type="button" class="icon icon-close" data-action="close" aria-label="${i18n.closeLabel}" title="${i18n.closeTitle}"><svg viewBox="0 0 10 10"><line x1="2" y1="2" x2="8" y2="8"/><line x1="8" y1="2" x2="2" y2="8"/></svg></button></div>`;
             html.appendChild(titlebar);
-            const maximizeButton = titlebar.querySelector('[data-action="maximize"]');
-
-            const syncMaximizeState = async () => {
-                if (!maximizeButton) return;
-                try {
-                    const maximized = await invoke('window_is_maximized');
-                    maximizeButton.dataset.maximized = maximized ? 'true' : 'false';
-                    maximizeButton.title = maximized ? i18n.restoreTitle : i18n.maximizeActionTitle;
-                    maximizeButton.setAttribute('aria-label', maximized ? i18n.restoreLabel : i18n.maximizeLabelText);
-                    maximizeButton.querySelector('.svg-maximize').style.display = maximized ? 'none' : '';
-                    maximizeButton.querySelector('.svg-restore').style.display = maximized ? '' : 'none';
-                } catch (e) {
-                    console.error('Failed to sync maximize state', e);
-                }
-            };
             titlebar.querySelectorAll('button[data-action]').forEach(button => {
                 button.addEventListener('click', async event => {
                     event.stopPropagation();
@@ -2512,14 +2511,23 @@ fn main_window_titlebar_injection_script() -> String {
                     }
                 });
             });
-            window.addEventListener('resize', () => { void syncMaximizeState(); });
             void syncMaximizeState();
         };
         ensureTitlebar();
+        if (!window.__ALAS_TITLEBAR_RESIZE_INSTALLED) {
+            window.__ALAS_TITLEBAR_RESIZE_INSTALLED = true;
+            window.addEventListener('resize', () => { void syncMaximizeState(); });
+        }
         if (!window.__ALAS_TITLEBAR_OBSERVER) {
             let pending = 0;
             const schedule = () => {
                 if (pending) return;
+                const existing = document.getElementById('alas-launcher-titlebar');
+                if (existing
+                    && existing.parentNode === document.documentElement
+                    && document.getElementById('alas-launcher-titlebar-style')) {
+                    return;
+                }
                 pending = requestAnimationFrame(() => {
                     pending = 0;
                     ensureTitlebar();
@@ -2527,8 +2535,7 @@ fn main_window_titlebar_injection_script() -> String {
             };
             window.__ALAS_TITLEBAR_OBSERVER = new MutationObserver(schedule);
             window.__ALAS_TITLEBAR_OBSERVER.observe(document.documentElement, {
-                childList: true,
-                subtree: true
+                childList: true
             });
         }
         "#);
