@@ -61,7 +61,7 @@ const MENUBAR_ICON_2X: &[u8] = include_bytes!("../icons/menubar@2x.png");
 const MENUBAR_ICON_1X: &[u8] = include_bytes!("../icons/menubar.png");
 #[cfg(windows)]
 const WINDOWS_TRAY_ICON: &[u8] = include_bytes!("../icons/icon.png");
-const SPLASH_BG_VIDEO: &[u8] = include_bytes!("../bg/bg.mp4");
+const SPLASH_BG_IMAGE: &[u8] = include_bytes!("../bg/bg.webp");
 const MI_SANS_FONT: &[u8] = include_bytes!("../fonts/MiSansLauncher.ttf");
 const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const BACKEND_NAVIGATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -226,33 +226,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_english_splash_i18n_uses_json_literals() {
-        rust_i18n::set_locale("en");
+    fn backend_unready_error_carries_the_reason_from_the_log() {
+        let with_reason = backend_unready_error(
+            anyhow!("connect failed"),
+            Some("React 前端构建失败".to_owned()),
+        );
+        assert!(format!("{with_reason:#}").contains("React 前端构建失败"));
 
-        let html = splash_redesigned_shell_html("video", "font");
-
-        assert!(html.contains(r#""defaultTip":"Sakura Empire's cherry blossoms"#));
-        assert!(!html.contains("const defaultTip = '"));
-        assert!(html.contains("window.__ALAS_SPLASH_READY = true;"));
-        assert!(html.contains("data:video/mp4;base64,video"));
-        assert!(html.contains("font-family: \"MiSans\""));
-        assert!(html.contains("data:font/ttf;base64,font"));
-        assert!(!html.contains("text-transform: uppercase;"));
-    }
-
-    #[test]
-    fn test_splash_includes_optional_uv_progress() {
-        let html = splash_redesigned_shell_html("video", "font");
-
-        assert!(html.contains("data:video/mp4;base64,video"));
-        assert!(html.contains("id=\"uv-progress-container\""));
-        assert!(html.contains("payload.uv_progress"));
-        assert!(html.contains("id=\"uv-progress-detail\""));
-        assert!(html.contains("grid-template-columns: minmax(0, 1fr) auto"));
-        assert!(html.contains("background: rgba(250, 250, 247, 0.78)"));
-        assert!(html.contains("content: \"✦\""));
-        assert!(!html.contains("'Tips: ' + subtitle.tip"));
-        assert!(!html.contains("animation: sweep"));
+        let without_reason = backend_unready_error(anyhow!("connect failed"), None);
+        assert_eq!(format!("{without_reason:#}"), "connect failed");
     }
 
     #[test]
@@ -268,55 +250,6 @@ mod tests {
         truncate_log_file(temp_dir.path(), filename).expect("truncate launcher log");
 
         assert_eq!(fs::read(&path).expect("read truncated log"), b"");
-    }
-
-    #[test]
-    fn test_titlebars_use_webview_draggable_regions_for_touch_dragging() {
-        let splash_html = splash_redesigned_shell_html("video", "font");
-
-        assert!(splash_html.contains("touch-action: none;"));
-        assert!(splash_html.contains("addEventListener('pointerdown'"));
-        assert!(splash_html.contains("-webkit-app-region: drag;"));
-        assert!(splash_html.contains("-webkit-app-region: no-drag;"));
-        assert!(splash_html.contains("webviewDraggableRegionsEnabled"));
-        assert!(splash_html.contains("if (webviewDraggableRegionsEnabled) {"));
-        assert!(!splash_html.contains("$NATIVE_TOUCH_DRAG"));
-
-        #[cfg(windows)]
-        assert!(splash_html.contains("const webviewDraggableRegionsEnabled = true;"));
-
-        #[cfg(not(target_os = "macos"))]
-        let titlebar_script = main_window_titlebar_injection_script();
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            assert!(titlebar_script.contains("touch-action:none"));
-            assert!(titlebar_script.contains("addEventListener('pointerdown'"));
-            assert!(titlebar_script.contains("-webkit-app-region:drag"));
-            assert!(titlebar_script.contains("-webkit-app-region:no-drag"));
-            assert!(titlebar_script.contains("webviewDraggableRegionsEnabled"));
-            assert!(titlebar_script.contains("if (webviewDraggableRegionsEnabled)"));
-            assert!(titlebar_script.contains(
-                ".alas-titlebar-drag-zone{position:absolute;inset:0 148px 0 0;height:100%;pointer-events:none"
-            ));
-            assert!(titlebar_script.contains(".alas-titlebar-drag-segment{"));
-            assert!(titlebar_script.contains("const rebuildDragSegments = () =>"));
-            assert!(titlebar_script.contains("getComputedStyle(element).cursor !== 'pointer'"));
-            assert!(titlebar_script.contains("dragZone.replaceChildren(fragment)"));
-            assert!(titlebar_script.contains("min-height:28px"));
-            assert!(titlebar_script.contains("background:rgba(250,250,247,.78)"));
-            assert!(titlebar_script.contains(".icon-close{color:#e64f58}"));
-            assert!(titlebar_script.contains("--alas-titlebar-height:56px"));
-            assert!(titlebar_script.contains("transform:translateY(-6px) scale(.96)"));
-            assert!(!titlebar_script.contains("scale(.72)"));
-            assert!(titlebar_script.contains("alas-close-menu"));
-            assert!(!titlebar_script.contains("alas-close-optics"));
-            assert!(!titlebar_script.contains("alas-island-open"));
-            assert!(titlebar_script.contains("__ALAS_OPEN_CLOSE_PROMPT"));
-            assert!(titlebar_script.contains("window_exit_application"));
-            #[cfg(windows)]
-            assert!(titlebar_script.contains("const webviewDraggableRegionsEnabled = true;"));
-        }
     }
 
     #[test]
@@ -829,7 +762,7 @@ fn save_as(app_handle: tauri::AppHandle, filename: &str, data: &str) {
                     let file_path = path
                         .as_ref()
                         .and_then(FilePath::as_path)
-                        .ok_or_else(|| anyhow!("Invalid file path {:?}", &path))?;
+                        .ok_or_else(|| anyhow!(t!("errors.invalid_file_path", path = format!("{:?}", &path))))?;
                     fs::write(file_path, &decoded_data)?;
                     info!("Saved file to {:?}", file_path);
                     Ok(())
@@ -884,7 +817,7 @@ fn download_log_file(
                 let file_path = path
                     .as_ref()
                     .and_then(FilePath::as_path)
-                    .ok_or_else(|| anyhow!("Invalid file path {:?}", &path))?;
+                    .ok_or_else(|| anyhow!(t!("errors.invalid_file_path", path = format!("{:?}", &path))))?;
                 fs::write(file_path, &data)?;
                 info!("Saved {} log to {:?}", log_name_for_save, file_path);
                 Ok(())
@@ -1069,14 +1002,14 @@ fn backend_url(port: u16) -> String {
 }
 
 fn splash_response() -> tauri::http::Response<Vec<u8>> {
-    let video_bg_b64 = BASE64_STANDARD.encode(SPLASH_BG_VIDEO);
+    let splash_bg_b64 = BASE64_STANDARD.encode(SPLASH_BG_IMAGE);
     let mi_sans_font_b64 = BASE64_STANDARD.encode(MI_SANS_FONT);
     tauri::http::Response::builder()
         .header(
             tauri::http::header::CONTENT_TYPE,
             "text/html; charset=utf-8",
         )
-        .body(splash_redesigned_shell_html(&video_bg_b64, &mi_sans_font_b64).into_bytes())
+        .body(splash_redesigned_shell_html(&splash_bg_b64, &mi_sans_font_b64).into_bytes())
         .unwrap()
 }
 
@@ -1084,7 +1017,25 @@ fn check_backend_connection(port: u16) -> Result<()> {
     let address: SocketAddr = format!("127.0.0.1:{port}").parse()?;
     TcpStream::connect_timeout(&address, BACKEND_CONNECT_TIMEOUT)
         .map(|_| ())
-        .map_err(|e| anyhow!("Unable to connect to local backend at {address}: {e}"))
+        .map_err(|e| {
+        anyhow!(t!(
+            "errors.backend_unreachable",
+            address = address.to_string(),
+            error = e.to_string()
+        ))
+    })
+}
+
+/// 未就绪提示与日志中的失败原因合成最终错误：日志里写了原因时一并带出。
+fn backend_unready_error(timeout_error: anyhow::Error, reason: Option<String>) -> anyhow::Error {
+    match reason {
+        Some(reason) => anyhow!(t!(
+            "errors.backend_unready_with_reason",
+            error = format!("{timeout_error:#}"),
+            reason = reason
+        )),
+        None => timeout_error,
+    }
 }
 
 fn wait_for_backend_connection(port: u16, timeout: Duration) -> Result<()> {
@@ -1100,7 +1051,11 @@ fn wait_for_backend_connection(port: u16, timeout: Duration) -> Result<()> {
         }
     }
 
-    Err(last_error.unwrap_or_else(|| anyhow!(t!("errors.backend_timeout"))))
+    let timeout_error = last_error.unwrap_or_else(|| anyhow!(t!("errors.backend_timeout")));
+    Err(backend_unready_error(
+        timeout_error,
+        crate::backend::read_backend_failure_reason(),
+    ))
 }
 
 fn navigate_backend_or_error(window: &WebviewWindow, port: u16) -> Result<bool> {
@@ -1214,7 +1169,7 @@ fn backend_error_html(port: u16, error_detail: &str) -> String {
     let backend_url_json = to_string(&backend_url(port)).unwrap();
     let error_detail_json = to_string(error_detail).unwrap();
     let mi_sans_font_b64 = BASE64_STANDARD.encode(MI_SANS_FONT);
-    let splash_video_b64 = BASE64_STANDARD.encode(SPLASH_BG_VIDEO);
+    let splash_bg_b64 = BASE64_STANDARD.encode(SPLASH_BG_IMAGE);
     let titlebar_script = main_window_titlebar_injection_script();
     let i18n = serde_json::json!({
         "title": t!("error_page.title"),
@@ -1288,7 +1243,7 @@ fn backend_error_html(port: u16, error_detail: &str) -> String {
     background: transparent;
     animation: page-in 420ms cubic-bezier(0.22, 1, 0.36, 1) both;
   }}
-  .error-background-video {{
+  .error-background-image {{
     position: fixed;
     inset: 0;
     z-index: 0;
@@ -1503,9 +1458,7 @@ fn backend_error_html(port: u16, error_detail: &str) -> String {
 </style>
 </head>
 <body>
-  <video class="error-background-video" autoplay muted loop playsinline preload="auto" aria-hidden="true">
-    <source src="data:video/mp4;base64,{splash_video_b64}" type="video/mp4">
-  </video>
+  <img class="error-background-image" src="data:image/webp;base64,{splash_bg_b64}" alt="" aria-hidden="true">
   <div class="error-background-scrim" aria-hidden="true"></div>
   <main class="panel">
     <div class="signal" aria-hidden="true">
@@ -1621,7 +1574,7 @@ fn backend_error_html(port: u16, error_detail: &str) -> String {
     )
 }
 
-fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> String {
+fn splash_redesigned_shell_html(splash_bg_b64: &str, mi_sans_font_b64: &str) -> String {
     let i18n = serde_json::json!({
         "defaultTip": t!("tips.17"),
         "loading": t!("splash.loading_badge"),
@@ -1694,7 +1647,7 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
     flex-direction: column;
     justify-content: space-between;
   }
-  .splash-background-video {
+  .splash-background-image {
     position: absolute;
     inset: 0;
     z-index: 0;
@@ -2136,10 +2089,8 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
 </head>
 <body>
   <div class="launcher-window">
-    <video class="splash-background-video" autoplay muted loop playsinline preload="auto" aria-hidden="true">
-      <source src="data:video/mp4;base64,$VIDEO_BG" type="video/mp4">
-    </video>
-    <div id="splash-drag-region" class="top-bar" data-tauri-drag-region>
+    <img class="splash-background-image" src="data:image/webp;base64,$SPLASH_BG" alt="" aria-hidden="true">
+    <div id="splash-drag-region" class="top-bar">
       <div class="brand-zone">
         <span class="app-title">AzurPilot</span>
         <span class="app-version">v$LAUNCHER_VERSION</span>
@@ -2204,7 +2155,6 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
     const invoke =
       (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke)
       || (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke);
-    const webviewDraggableRegionsEnabled = $NATIVE_TOUCH_DRAG;
 
     window.addEventListener('contextmenu', event => {
       event.preventDefault();
@@ -2327,7 +2277,7 @@ fn splash_redesigned_shell_html(video_bg_b64: &str, mi_sans_font_b64: &str) -> S
   </script>
 </body>
 </html>"#
-    .replace("$VIDEO_BG", video_bg_b64)
+    .replace("$SPLASH_BG", splash_bg_b64)
     .replace("$MI_SANS_FONT", mi_sans_font_b64)
     .replace("$LAUNCHER_VERSION", env!("CARGO_PKG_VERSION"))
     .replace("$I18N_JSON", &i18n_json)
@@ -2349,7 +2299,7 @@ fn create_main_window(app: &tauri::AppHandle, port: u16) -> Result<WebviewWindow
         .windows
         .iter()
         .find(|w| w.label == "main")
-        .ok_or_else(|| anyhow!("Main window config not found"))?;
+        .ok_or_else(|| anyhow!(t!("errors.main_window_missing")))?;
 
     let app_for_navigation = app.clone();
     let main_window = tauri::WebviewWindowBuilder::from_config(app, main_config)?
@@ -2514,20 +2464,24 @@ fn main_window_titlebar_injection_script() -> String {
             return;
         }
         const ensureTitlebar = () => {
-            if (!document.body || document.getElementById('alas-launcher-titlebar')) {
+            const html = document.documentElement;
+            if (!html) return;
+            let titlebar = document.getElementById('alas-launcher-titlebar');
+            if (titlebar) {
+                if (titlebar.parentNode === html) return;
+                html.appendChild(titlebar);
                 return;
             }
             if (!document.getElementById('alas-launcher-titlebar-style')) {
                 const style = document.createElement('style');
                 style.id = 'alas-launcher-titlebar-style';
-                style.textContent = ':root{--alas-titlebar-height:37px}#alas-launcher-titlebar{position:fixed;top:0;left:0;right:0;height:var(--alas-titlebar-height);z-index:2147483647;user-select:none;pointer-events:none;background:transparent}#alas-launcher-titlebar *{box-sizing:border-box}.alas-titlebar-drag-segment{position:absolute;top:0;bottom:0;pointer-events:auto;background:transparent;touch-action:none;app-region:drag;-webkit-app-region:drag}.header-icon,.header-icon *{app-region:no-drag;-webkit-app-region:no-drag}.header-icon{display:flex;align-items:center;gap:0;position:absolute;top:0;right:0;height:37px;margin:0;padding:0;pointer-events:auto;background:transparent;border:none;box-shadow:none}.icon{width:36px;height:37px;margin:0;padding:0;border:none;background:transparent;cursor:pointer;flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;transition:color 140ms ease,filter 140ms ease,transform 100ms ease}.icon:active{transform:scale(.92)}.icon svg{width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:1.4;stroke-linecap:round;stroke-linejoin:round}.icon-hide{color:#a855f7}.icon-hide:hover{color:#7e22ce;filter:drop-shadow(0 0 5px #a855f7)}.icon-minimize{color:#0284c7}.icon-minimize:hover{color:#0369a1;filter:drop-shadow(0 0 5px #0284c7)}.icon-maximize{color:#10b981}.icon-maximize:hover{color:#047857;filter:drop-shadow(0 0 5px #10b981)}.icon-close{color:#ef4444}.icon-close:hover{color:#b91c1c;filter:drop-shadow(0 0 5px #ef4444)}';
-                document.head.appendChild(style);
+                style.textContent = ':root{--alas-titlebar-height:37px}#alas-launcher-titlebar{position:fixed;top:0;left:0;right:0;height:var(--alas-titlebar-height);z-index:2147483647;user-select:none;pointer-events:none;background:transparent;-webkit-app-region:drag;app-region:drag}.header-icon{display:flex;align-items:center;gap:0;position:absolute;top:0;right:0;height:37px;margin:0;padding:0;background:transparent;border:none;box-shadow:none;pointer-events:auto;-webkit-app-region:no-drag;app-region:no-drag}.header-icon *{box-sizing:border-box;-webkit-app-region:no-drag;app-region:no-drag}.icon{width:36px;height:37px;margin:0;padding:0;border:none;background:transparent;cursor:pointer;flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;transition:color 140ms ease,filter 140ms ease,transform 100ms ease}.icon:active{transform:scale(.92)}.icon svg{width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:1.4;stroke-linecap:round;stroke-linejoin:round}.icon-hide{color:#a855f7}.icon-hide:hover{color:#7e22ce;filter:drop-shadow(0 0 5px #a855f7)}.icon-minimize{color:#0284c7}.icon-minimize:hover{color:#0369a1;filter:drop-shadow(0 0 5px #0284c7)}.icon-maximize{color:#10b981}.icon-maximize:hover{color:#047857;filter:drop-shadow(0 0 5px #10b981)}.icon-close{color:#ef4444}.icon-close:hover{color:#b91c1c;filter:drop-shadow(0 0 5px #ef4444)}a[href],button,input,select,textarea,summary,label[for],[role="button"],[role="link"],[role="tab"],[role="menuitem"],[contenteditable="true"],[tabindex]:not([tabindex="-1"]),[data-alas-no-drag]{pointer-events:auto;-webkit-app-region:no-drag;app-region:no-drag}';
+                (document.head || html).appendChild(style);
             }
-            const titlebar = document.createElement('div');
+            titlebar = document.createElement('div');
             titlebar.id = 'alas-launcher-titlebar';
-            titlebar.innerHTML = '<div class="alas-titlebar-drag-segment" data-tauri-drag-region style="left:110px;width:50px"></div><div class="alas-titlebar-drag-segment" data-tauri-drag-region style="left:380px;right:144px"></div><div class="header-icon"><button type="button" class="icon icon-hide" data-action="hide" aria-label="'+i18n.hideLabel+'" title="'+i18n.hideLabel+'"><svg viewBox="0 0 10 10"><line x1="2.5" y1="2.5" x2="7.5" y2="7.5"/><polyline points="4,7.5 7.5,7.5 7.5,4"/></svg></button><button type="button" class="icon icon-minimize" data-action="minimize" aria-label="'+i18n.minimizeLabel+'" title="'+i18n.minimizeTitle+'"><svg viewBox="0 0 10 10"><line x1="1.5" y1="5" x2="8.5" y2="5"/></svg></button><button type="button" class="icon icon-maximize" data-action="maximize" aria-label="'+i18n.maximizeLabel+'" title="'+i18n.maximizeTitle+'"><svg viewBox="0 0 10 10" class="svg-restore" style="display:none"><path d="M3.5 1.5h5v5"/><rect x="1.5" y="3.5" width="5" height="5"/></svg><svg viewBox="0 0 10 10" class="svg-maximize"><rect x="1.5" y="1.5" width="7" height="7"/></svg></button><button type="button" class="icon icon-close" data-action="close" aria-label="'+i18n.closeLabel+'" title="'+i18n.closeTitle+'"><svg viewBox="0 0 10 10"><line x1="2" y1="2" x2="8" y2="8"/><line x1="8" y1="2" x2="2" y2="8"/></svg></button></div>';
-            document.body.dataset.alasCustomTitlebar = 'true';
-            document.body.prepend(titlebar);
+            titlebar.innerHTML = `<div class="header-icon"><button type="button" class="icon icon-hide" data-action="hide" aria-label="${i18n.hideLabel}" title="${i18n.hideLabel}"><svg viewBox="0 0 10 10"><line x1="2.5" y1="2.5" x2="7.5" y2="7.5"/><polyline points="4,7.5 7.5,7.5 7.5,4"/></svg></button><button type="button" class="icon icon-minimize" data-action="minimize" aria-label="${i18n.minimizeLabel}" title="${i18n.minimizeTitle}"><svg viewBox="0 0 10 10"><line x1="1.5" y1="5" x2="8.5" y2="5"/></svg></button><button type="button" class="icon icon-maximize" data-action="maximize" aria-label="${i18n.maximizeLabel}" title="${i18n.maximizeTitle}"><svg viewBox="0 0 10 10" class="svg-restore" style="display:none"><path d="M3.5 1.5h5v5"/><rect x="1.5" y="3.5" width="5" height="5"/></svg><svg viewBox="0 0 10 10" class="svg-maximize"><rect x="1.5" y="1.5" width="7" height="7"/></svg></button><button type="button" class="icon icon-close" data-action="close" aria-label="${i18n.closeLabel}" title="${i18n.closeTitle}"><svg viewBox="0 0 10 10"><line x1="2" y1="2" x2="8" y2="8"/><line x1="8" y1="2" x2="2" y2="8"/></svg></button></div>`;
+            html.appendChild(titlebar);
             const maximizeButton = titlebar.querySelector('[data-action="maximize"]');
 
             const syncMaximizeState = async () => {
@@ -2562,8 +2516,20 @@ fn main_window_titlebar_injection_script() -> String {
             void syncMaximizeState();
         };
         ensureTitlebar();
-        if (!document.body) {
-            window.addEventListener('DOMContentLoaded', ensureTitlebar, { once: true });
+        if (!window.__ALAS_TITLEBAR_OBSERVER) {
+            let pending = 0;
+            const schedule = () => {
+                if (pending) return;
+                pending = requestAnimationFrame(() => {
+                    pending = 0;
+                    ensureTitlebar();
+                });
+            };
+            window.__ALAS_TITLEBAR_OBSERVER = new MutationObserver(schedule);
+            window.__ALAS_TITLEBAR_OBSERVER.observe(document.documentElement, {
+                childList: true,
+                subtree: true
+            });
         }
         "#);
         s

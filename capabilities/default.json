@@ -14,7 +14,6 @@
   },
   "permissions": [
 	"core:default",
-	"core:window:allow-start-dragging",
 	"dialog:default",
 	"notification:default",
     "window-state:default",

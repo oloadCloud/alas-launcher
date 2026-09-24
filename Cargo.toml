@@ -34,11 +34,8 @@ sys-locale = "0.3"
 [dev-dependencies]
 tempfile = "3"
 
-[target.'cfg(unix)'.dependencies]
-nix = { version = "0.30", features = ["signal"] }
-
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["consoleapi", "winbase"] }
+winapi = { version = "0.3", features = ["consoleapi", "winbase", "wincon"] }
 tauri-winrt-notification = "0.7.2"
 windows-registry = "0.4"
 
